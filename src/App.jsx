@@ -2116,12 +2116,15 @@ function backtestConfluenceRolling(closes) {
   };
 }
 
-function buildStates(closes) {
+function buildStates(bars) {
+  const closes = bars.map((b) => b.c);
+  const highs = bars.map((b) => b.h);
+  const lows = bars.map((b) => b.l);
   const ma50 = sma(closes, 50),
     ma200 = sma(closes, 200);
   const rsiArr = rsi(closes),
     mac = macd(closes),
-    piv = pivots(closes, 4);
+    piv = pivotsOHLC(bars, 4);
   const states = new Array(closes.length).fill(null);
   let pi = 0;
   const H = [],
@@ -2135,9 +2138,13 @@ function buildStates(closes) {
     const hh = H[H.length - 1].price > H[H.length - 2].price;
     const hl = L[L.length - 1].price > L[L.length - 2].price;
     const dow = hh && hl ? "u" : !hh && !hl ? "d" : "s";
-    const win = closes.slice(i - 40, i);
-    const R = Math.max(...win),
-      S = Math.min(...win);
+    // R/S để so khớp trạng thái giờ lấy từ High/Low THẬT 40 phiên gần nhất —
+    // trước đây dùng Math.max/min của Close, KHÔNG khớp với R/S OHLC thật
+    // đang hiển thị ở Kịch bản giao dịch (Layer 6).
+    const winH = highs.slice(i - 40, i),
+      winL = lows.slice(i - 40, i);
+    const R = Math.max(...winH),
+      S = Math.min(...winL);
     const pos = (closes[i] - S) / (R - S || 1e-9);
     const r = rsiArr[i];
     states[i] = {
@@ -2163,7 +2170,10 @@ const STATE_VN = {
   vs50: { a: "trên MA50", b: "dưới MA50" },
   mh: { p: "MACD hist dương", n: "MACD hist âm" },
 };
-function analogProbabilities(closes, states, horizon = 20) {
+function analogProbabilities(bars, states, horizon = 20) {
+  const closes = bars.map((b) => b.c);
+  const highs = bars.map((b) => b.h);
+  const lows = bars.map((b) => b.l);
   let cs = null,
     ci = -1;
   for (let i = states.length - 1; i >= 0; i--)
@@ -2194,11 +2204,13 @@ function analogProbabilities(closes, states, horizon = 20) {
         const st = states[i];
         let res = "c";
         for (let j = i + 1; j <= i + horizon; j++) {
-          if (closes[j] > st.R) {
+          // Chạm bằng High/Low THẬT — trước đây so bằng Close nên bóng nến
+          // chọc qua R/S vẫn bị tính là "chưa chạm", sai bản chất "chạm".
+          if (highs[j] > st.R) {
             res = "a";
             break;
           }
-          if (closes[j] < st.S) {
+          if (lows[j] < st.S) {
             res = "b";
             break;
           }
@@ -2235,7 +2247,10 @@ function analogProbabilities(closes, states, horizon = 20) {
 // mà tỷ lệ lịch sử chạm được vẫn ≥ ngưỡng mong muốn (mặc định 90%) trong tối
 // đa maxHorizon phiên — đây là mục tiêu "tối ưu": xa nhất có thể trong khi
 // vẫn giữ độ tin cậy cao, thay vì một mức tuỳ ý.
-function analogFibTargets(closes, states, maxHorizon = 60, minHitRatePct = 90) {
+function analogFibTargets(bars, states, maxHorizon = 60, minHitRatePct = 90) {
+  const closes = bars.map((b) => b.c);
+  const highs = bars.map((b) => b.h);
+  const lows = bars.map((b) => b.l);
   let cs = null,
     ci = -1;
   for (let i = states.length - 1; i >= 0; i--)
@@ -2279,7 +2294,8 @@ function analogFibTargets(closes, states, maxHorizon = 60, minHitRatePct = 90) {
       let hitDay = null;
       const jMax = Math.min(i + maxHorizon, closes.length - 1);
       for (let j = i + 1; j <= jMax; j++) {
-        if (dir === "up" ? closes[j] >= target : closes[j] <= target) {
+        // Chạm bằng High/Low thật (không phải Close) — đúng bản chất "chạm target".
+        if (dir === "up" ? highs[j] >= target : lows[j] <= target) {
           hitDay = j - i;
           break;
         }
@@ -2350,6 +2366,124 @@ function analogFibTargets(closes, states, maxHorizon = 60, minHitRatePct = 90) {
     up: upBest,
     down: downBest,
     better,
+  };
+}
+
+// Xác suất chạm R/S HIỆN TẠI (High/Low thật) + phân phối hướng giá 3/4/5 phiên
+// tới — khớp trạng thái CÙNG CÁCH với analogProbabilities/analogFibTargets
+// (Dow + vị trí trong biên + RSI + MA50 + MACD hist), nên số ra nhất quán với
+// 2 chỉ số kia thay vì một phép đo khác đi tính riêng.
+function analogForwardStats(bars, states, sessions = [3, 4, 5]) {
+  const closes = bars.map((b) => b.c);
+  const highs = bars.map((b) => b.h);
+  const lows = bars.map((b) => b.l);
+  let cs = null,
+    ci = -1;
+  for (let i = states.length - 1; i >= 0; i--)
+    if (states[i]) {
+      cs = states[i];
+      ci = i;
+      break;
+    }
+  if (!cs) return null;
+
+  const maxSess = Math.max(...sessions);
+  const dimSets = [
+    ["dow", "posB", "rB", "vs50", "mh"],
+    ["dow", "posB", "rB", "vs50"],
+    ["dow", "posB", "rB"],
+    ["dow", "posB"],
+  ];
+  let matches = [],
+    usedKeys = null;
+  for (const keys of dimSets) {
+    const m = [];
+    for (let i = 210; i < states.length - maxSess - 1; i++) {
+      const st = states[i];
+      if (!st || i === ci) continue;
+      if (keys.every((k) => st[k] === cs[k])) m.push(i);
+    }
+    if (m.length >= 25 || keys.length === 2) {
+      matches = m;
+      usedKeys = keys;
+      break;
+    }
+  }
+  if (!matches.length) return null;
+
+  // Xác suất chạm R/S CỦA CHÍNH THỜI ĐIỂM khớp (st.R/st.S, không phải R/S hiện
+  // tại) trong vòng maxSess phiên kể từ lúc khớp — đo bằng High/Low thật.
+  let touchR = 0,
+    touchS = 0;
+  const touchDaysR = [],
+    touchDaysS = [];
+  matches.forEach((i) => {
+    const st = states[i];
+    for (let j = i + 1; j <= Math.min(i + maxSess, closes.length - 1); j++) {
+      if (highs[j] > st.R) {
+        touchR++;
+        touchDaysR.push(j - i);
+        break;
+      }
+    }
+  });
+  matches.forEach((i) => {
+    const st = states[i];
+    for (let j = i + 1; j <= Math.min(i + maxSess, closes.length - 1); j++) {
+      if (lows[j] < st.S) {
+        touchS++;
+        touchDaysS.push(j - i);
+        break;
+      }
+    }
+  });
+  const med = (arr) => {
+    if (!arr.length) return null;
+    const s = [...arr].sort((a, b) => a - b);
+    return s[Math.floor(s.length / 2)];
+  };
+
+  // Phân phối hướng giá tại từng mốc N phiên tới (so với Close lúc khớp trạng thái).
+  const bySession = sessions.map((n) => {
+    let up = 0,
+      down = 0,
+      flat = 0;
+    const rets = [];
+    matches.forEach((i) => {
+      const j = i + n;
+      if (j >= closes.length) return;
+      const ret = (closes[j] - closes[i]) / closes[i];
+      rets.push(ret);
+      if (ret > 0.0005) up++;
+      else if (ret < -0.0005) down++;
+      else flat++;
+    });
+    const total = up + down + flat || 1;
+    const avgRet = rets.length
+      ? rets.reduce((s, r) => s + r, 0) / rets.length
+      : null;
+    return {
+      n,
+      upPct: Math.round((up / total) * 100),
+      downPct: Math.round((down / total) * 100),
+      flatPct: Math.round((flat / total) * 100),
+      avgRetPct: avgRet != null ? avgRet * 100 : null,
+      medRetPct: med(rets.map((r) => r)) != null ? med(rets) * 100 : null,
+      sample: rets.length,
+    };
+  });
+
+  return {
+    n: matches.length,
+    dims: usedKeys.length,
+    maxSess,
+    R: cs.R,
+    S: cs.S,
+    touchRPct: Math.round((touchR / matches.length) * 100),
+    touchSPct: Math.round((touchS / matches.length) * 100),
+    medianDaysToR: med(touchDaysR),
+    medianDaysToS: med(touchDaysS),
+    bySession,
   };
 }
 
@@ -3210,9 +3344,9 @@ function screenPair(cfg, pd, opts) {
   else if (last < S40) state = "RUN_DOWN";
   else if (Math.min(R - last, last - S) / range < 0.15) state = "NEAR_TRIGGER";
 
-  const states = buildStates(closes);
-  const analog = analogProbabilities(closes, states);
-  const fibTargets = analogFibTargets(closes, states, 60, 90);
+  const states = buildStates(barsD);
+  const analog = analogProbabilities(barsD, states);
+  const fibTargets = analogFibTargets(barsD, states, 60, 90);
   const rule = scanBreakoutRule(closes);
   const atr = atrOHLC(barsD, opts.atrPeriod);
   const volPct = ((atr[n - 1] ?? 0) / last) * 100;
@@ -3389,9 +3523,9 @@ function screenPairStrategic(cfg, pd, opts) {
   else if (last < S40) state = "RUN_DOWN";
   else if (Math.min(R - last, last - S) / range < 0.15) state = "NEAR_TRIGGER";
 
-  const states = buildStates(closes);
-  const analog = analogProbabilities(closes, states);
-  const fibTargets = analogFibTargets(closes, states, 60, 90);
+  const states = buildStates(barsW);
+  const analog = analogProbabilities(barsW, states);
+  const fibTargets = analogFibTargets(barsW, states, 60, 90);
   const rule = scanBreakoutRule(closes);
   const atr = atrOHLC(barsW, opts.atrPeriod);
   const volPct = ((atr[n - 1] ?? 0) / last) * 100;
@@ -6608,6 +6742,7 @@ function PlaybookLayer({
   goLayer,
   analog,
   fibTargets,
+  forward,
   gates,
 }) {
   const probOf = (id) =>
@@ -6792,6 +6927,73 @@ function PlaybookLayer({
               cao hơn (cả 2 hướng đều đã được lọc về đúng ngưỡng{" "}
               {fibTargets.minHitRatePct}%). Giả định tỷ lệ chạm giảm dần khi mức
               càng xa; nếu mẫu {fibTargets.n} nhỏ, số liệu kém tin cậy.
+            </p>
+          </div>
+        )}
+        {forward && (
+          <div className="scen" style={{ marginBottom: 10 }}>
+            <b>📊 Xác suất chạm R/S &amp; hướng giá {forward.maxSess} phiên tới</b>
+            <p className="sub" style={{ margin: "4px 0 8px" }}>
+              Cùng {forward.n} lần khớp trạng thái ở trên ({forward.dims}/5
+              điều kiện) — đo bằng High/Low thật (chạm bằng bóng nến cũng
+              tính, không cần đóng cửa vượt qua).
+            </p>
+            <div
+              style={{
+                display: "flex",
+                gap: 8,
+                flexWrap: "wrap",
+                marginBottom: 10,
+              }}
+            >
+              <Chip cls="up">
+                Chạm R trong ≤{forward.maxSess} phiên: {forward.touchRPct}%
+                {forward.medianDaysToR != null
+                  ? ` (trung vị ${forward.medianDaysToR} phiên)`
+                  : ""}
+              </Chip>
+              <Chip cls="down">
+                Chạm S trong ≤{forward.maxSess} phiên: {forward.touchSPct}%
+                {forward.medianDaysToS != null
+                  ? ` (trung vị ${forward.medianDaysToS} phiên)`
+                  : ""}
+              </Chip>
+            </div>
+            <table className="tbl">
+              <thead>
+                <tr>
+                  <th>Phiên tới</th>
+                  <th>% Tăng</th>
+                  <th>% Giảm</th>
+                  <th>% Đi ngang</th>
+                  <th>Biến động TB</th>
+                </tr>
+              </thead>
+              <tbody>
+                {forward.bySession.map((s) => (
+                  <tr key={s.n}>
+                    <td className="num">+{s.n}</td>
+                    <td className="num" style={{ color: CLR.bull }}>
+                      {s.upPct}%
+                    </td>
+                    <td className="num" style={{ color: CLR.bear }}>
+                      {s.downPct}%
+                    </td>
+                    <td className="num" style={{ color: CLR.dim }}>
+                      {s.flatPct}%
+                    </td>
+                    <td className="num">
+                      {s.avgRetPct != null ? `${s.avgRetPct.toFixed(2)}%` : "—"}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+            <p className="sub" style={{ margin: "8px 0 0" }}>
+              "% Tăng/Giảm" so giá đóng cửa tại đúng N phiên sau so với lúc
+              khớp trạng thái (ngưỡng đi ngang ±0.05%). Đây là tần suất lịch
+              sử, không phải dự báo — mẫu {forward.n} lần{" "}
+              {forward.n < 40 ? "là NHỎ, đọc thận trọng" : "ở mức chấp nhận được"}.
             </p>
           </div>
         )}
@@ -9281,15 +9483,16 @@ export default function App() {
     if (!pd) return null;
     const closes = pd.D.map((b) => b.c),
       dates = pd.D.map((b) => b.d.slice(0, 10));
-    const states = buildStates(closes);
+    const states = buildStates(pd.D);
     return {
       closes,
       dates,
       events: scanPatternHistory(closes, dates),
       rule: scanBreakoutRule(closes),
       confl: backtestConfluenceRolling(closes),
-      analog: analogProbabilities(closes, states),
-      fibTargets: analogFibTargets(closes, states, 60),
+      analog: analogProbabilities(pd.D, states),
+      fibTargets: analogFibTargets(pd.D, states, 60),
+      forward: analogForwardStats(pd.D, states, [3, 4, 5]),
       system: backtestSystem(closes),
       swings: scanSwings(closes, dates),
     };
@@ -9724,6 +9927,7 @@ export default function App() {
                 goLayer={setLayer}
                 analog={hist ? hist.analog : null}
                 fibTargets={hist ? hist.fibTargets : null}
+                forward={hist ? hist.forward : null}
                 gates={model.gates}
               />
             )}
