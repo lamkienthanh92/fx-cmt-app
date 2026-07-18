@@ -12416,14 +12416,22 @@ export default function App() {
   const cfg = pairOf(pairKey);
 
   // Tháng/4H/1H — chỉ tải riêng cho cặp đang mở xem sâu (CMT/Hurst/Intraday).
-  const [pairExtra, setPairExtra] = useState({}); // symbol -> {status, error, M, H4, H1}
+  const [pairExtra, setPairExtra] = useState({}); // symbol -> {status, error, M, H4, H1, note}
+  // Set các symbol ĐÃ BẮT ĐẦU tải — dùng ref (không phải state) để việc effect
+  // này tự ghi vào `pairExtra` (progress note, kết quả...) không làm nó tự chạy
+  // lại rồi huỷ ngang chính phiên tải đang chạy (bug cũ: pairExtra vừa là điều
+  // kiện chạy effect vừa là thứ effect ghi vào → mỗi lần ghi là effect tự huỷ
+  // request đang chạy dở, kết quả trả về sau đó bị vứt bỏ vì cờ alive đã tắt).
+  const pairExtraStarted = useRef(new Set());
   useEffect(() => {
     setPairExtra({}); // reload = ép tải lại luôn phần Tháng/4H/1H của cặp đang mở
+    pairExtraStarted.current = new Set();
   }, [reload]);
   useEffect(() => {
     if (!["cmt", "hurst", "intraday"].includes(view) || !cfg) return;
     const sym = tdSymbol(cfg);
-    if (pairExtra[sym]) return; // đã có (hoặc đang tải)
+    if (pairExtraStarted.current.has(sym)) return; // đã bắt đầu tải (hoặc xong) rồi
+    pairExtraStarted.current.add(sym);
     setPairExtra((m) => ({ ...m, [sym]: { status: "loading" } }));
     let alive = true;
     loadPairExtraOHLC(sym, (msg) => {
@@ -12452,7 +12460,7 @@ export default function App() {
     return () => {
       alive = false;
     };
-  }, [view, cfg, pairExtra]);
+  }, [view, cfg]); // KHÔNG phụ thuộc pairExtra — xem giải thích ở khai báo pairExtraStarted phía trên
 
   // Đầy đủ 5 khung cho MỘT cặp — Ngày/Tuần lấy từ bulk, Tháng/4H/1H lấy từ
   // pairExtra (null cho tới khi tải xong) — dùng cho CMT/Hurst/Intraday.
