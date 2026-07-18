@@ -783,7 +783,10 @@ function dowTrend(piv) {
 // nến 1H kế tiếp — không dùng thông tin tương lai.
 // ------------------------------------------------------------
 function pivotsOHLC(bars, look = 3) {
-  const out = [];
+  // Bước 1: tìm mọi "đỉnh/đáy cục bộ" (fractal) độc lập theo từng phía — y hệt
+  // trước đây. Một nến hiếm khi vừa là đỉnh cục bộ vừa là đáy cục bộ (nến bao
+  // trùm/bị bao trùm) nên có thể sinh ra cả H lẫn L cùng index i.
+  const raw = [];
   for (let i = look; i < bars.length - look; i++) {
     const h = bars[i].h,
       l = bars[i].l;
@@ -793,8 +796,26 @@ function pivotsOHLC(bars, look = 3) {
       if (bars[i - k].h > h || bars[i + k].h > h) isH = false;
       if (bars[i - k].l < l || bars[i + k].l < l) isL = false;
     }
-    if (isH) out.push({ i, price: h, type: "H" });
-    else if (isL) out.push({ i, price: l, type: "L" });
+    if (isH) raw.push({ i, price: h, type: "H" });
+    if (isL) raw.push({ i, price: l, type: "L" });
+  }
+  raw.sort((a, b) => a.i - b.i);
+  // Bước 2: ÉP XEN KẼ — Dow Theory đòi hỏi đỉnh/đáy phải luôn xen kẽ Đ-đ-Đ-đ.
+  // Nếu 2 fractal cùng loại xuất hiện liên tiếp (chưa có điểm ngược loại xen
+  // giữa), chỉ giữ điểm CỰC TRỊ hơn (đỉnh cao hơn / đáy thấp hơn), bỏ điểm còn
+  // lại — thay vì giữ cả 2 khiến chuỗi so sánh "đỉnh sau > đỉnh trước" bị sai.
+  const out = [];
+  for (const p of raw) {
+    const last = out[out.length - 1];
+    if (!last || last.type !== p.type) {
+      out.push(p);
+    } else if (
+      (p.type === "H" && p.price > last.price) ||
+      (p.type === "L" && p.price < last.price)
+    ) {
+      out[out.length - 1] = p; // cùng loại liên tiếp — thay bằng điểm cực trị hơn
+    }
+    // ngược lại (p kém cực trị hơn last cùng loại) — bỏ qua p
   }
   return out;
 }
