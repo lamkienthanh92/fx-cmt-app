@@ -485,7 +485,7 @@ const tdSymbol = (cfg) => (cfg.crypto ? "BTC/USD" : cfg.label);
 // + .github/workflows/fetch-data.yml) — THAY "YOUR_GH_USERNAME/YOUR_REPO" bằng repo
 // thật của bạn sau khi đẩy code lên GitHub và bật workflow.
 const SCREENER_CACHE_URL =
-  "https://raw.githubusercontent.com/YOUR_GH_USERNAME/YOUR_REPO/main/data/screener-data.json";
+  "https://raw.githubusercontent.com/lamkienthanh92/fx-cmt-app/main/data/screener-data.json";
 
 // Gọi Twelve Data trực tiếp, tuần tự — chậm (~5-6 phút với gói free) nhưng luôn đúng.
 // Dùng làm phương án dự phòng khi chưa dựng cache, hoặc cache lỗi/rỗng.
