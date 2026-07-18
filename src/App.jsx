@@ -2943,10 +2943,8 @@ function buildConsensusTradesWithSL(pos, bh, closes, atr, slMult) {
       exitPrice,
       finalExitPrice: exitPrice,
       ret: cum - 1,
-      pips: (side * (exitPrice - ep)) / PIP_SIZE,
       slPrice,
       slDistance: slDist,
-      slPips: slDist ? slDist / PIP_SIZE : null,
       R: slDist ? (side * (exitPrice - ep)) / slDist : null,
       stoppedOut,
     });
