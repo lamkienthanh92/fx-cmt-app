@@ -1247,6 +1247,7 @@ function backtestLayered(
       let sl = structuralStop(bars1h, piv1h, sig.dir, i, atr, 3, 80, 0.3);
       const validSide =
         sl != null && (sig.dir === "long" ? sl < entry : sl > entry);
+      const slSource = validSide ? "structural" : "atr_fallback";
       if (!validSide)
         sl = sig.dir === "long" ? entry - atr * atrMult : entry + atr * atrMult;
       const risk = Math.abs(entry - sl);
@@ -1301,6 +1302,7 @@ function backtestLayered(
         entryIdx,
         legId: legOfBar[i],
         tpSource,
+        slSource,
         isAddon: sameLegOpen.length > 0,
       });
     }
@@ -1315,6 +1317,28 @@ function summarizeLayeredTrades(trades) {
   trades.forEach((t) => {
     bySource[t.tpSource] = (bySource[t.tpSource] || 0) + 1;
   });
+  // Chẩn đoán SL: bao nhiêu % lệnh dùng SL cấu trúc (swing hồi thật) so với SL ATR
+  // dự phòng (khi không tìm được swing phù hợp trong 80 nến gần nhất) — và mỗi
+  // nhóm có tỷ lệ dính SL / R trung bình khác nhau bao nhiêu. Nếu nhóm atr_fallback
+  // chiếm đa số VÀ có tỷ lệ dính SL cao hơn hẳn nhóm structural, đó là dấu hiệu SL
+  // đang quá sát do fallback kích hoạt thường xuyên — cần nới lookback tìm swing.
+  const slGroup = (src) => trades.filter((t) => t.slSource === src);
+  const slStats = (list) => ({
+    n: list.length,
+    slRate: list.length
+      ? Math.round((list.filter((t) => t.outcome === "sl").length / list.length) * 100)
+      : 0,
+    tpRate: list.length
+      ? Math.round((list.filter((t) => t.outcome === "tp").length / list.length) * 100)
+      : 0,
+    avgR: list.length
+      ? +(list.reduce((s, t) => s + t.r, 0) / list.length).toFixed(2)
+      : 0,
+  });
+  const bySLSource = {
+    structural: slStats(slGroup("structural")),
+    atr_fallback: slStats(slGroup("atr_fallback")),
+  };
   const clusters = {};
   trades.forEach((t) => {
     const key = `${t.legId}|${t.dir}`;
@@ -1329,6 +1353,7 @@ function summarizeLayeredTrades(trades) {
     addon,
     addonRate: trades.length ? Math.round((addon / trades.length) * 100) : 0,
     bySource,
+    bySLSource,
     clusters: clusterList.length,
     clusterWinRate: clusterList.length
       ? Math.round((clusterWins / clusterList.length) * 100)
@@ -7509,23 +7534,9 @@ function TrendLayer({
               <td className="num">{fmtA(c.D?.medAmpl)}</td>
               <td className="num">{c.D?.medDur ?? "—"} phiên</td>
               <td className="num" style={{ color: CLR.mut }}>
-                × {fmtR(c.projRatio)} →
+                {fmtR(c.rWD)} (W/D)
               </td>
               <td className="num">{c.D?.n ?? 0}</td>
-            </tr>
-            <tr style={{ background: "rgba(110,168,255,.06)" }}>
-              <td className="num" style={{ color: CLR.blue, fontWeight: 800 }}>
-                4H*
-              </td>
-              <td className="num" style={{ color: CLR.blue }}>
-                {fmtA(c.proj4H?.medAmpl)}
-              </td>
-              <td className="num" style={{ color: CLR.blue }}>
-                {c.proj4H?.medDurBars ?? "—"} nến 4H
-              </td>
-              <td colSpan={2} style={{ color: CLR.mut, fontSize: 11 }}>
-                *Suy diễn, KHÔNG phải dữ liệu thật
-              </td>
             </tr>
           </tbody>
         </table>
@@ -7536,20 +7547,20 @@ function TrendLayer({
             {c.consistent
               ? `Tỉ lệ bước xuống nhất quán (M/W ${fmtR(c.rMW)} ≈ W/D ${fmtR(
                   c.rWD
-                )}) — phép chiếu D→4H có cơ sở`
+                )}) — thị trường đang tự đồng dạng qua các khung`
               : `Tỉ lệ bước xuống KHÔNG đều (M/W ${fmtR(c.rMW)} vs W/D ${fmtR(
                   c.rWD
-                )}) — cặp này ít tự đồng dạng, đọc số 4H rất dè dặt`}
+                )}) — cặp này ít tự đồng dạng, các khung đang hành xử khác nhịp nhau`}
           </Chip>
         </div>
         <div className="fnote" style={{ marginTop: 12 }}>
           <b>Đọc thế nào</b>
           Xu hướng lớn là {trendVN[frames.D.trend].toLowerCase()} trên D, và
-          4H thật hiện đang {trendVN[frames.H4.trend].toLowerCase()}. Theo tự
-          đồng dạng, một sóng 4H điển hình của {cfg.label} rộng khoảng{" "}
-          {fmtA(c.proj4H?.medAmpl)} (~{c.proj4H?.medDurBars ?? "—"} nến) — dùng
-          con số này để ước lượng độ sâu hồi giá hợp lý, còn xu hướng 4H/1H
-          thật thì đọc trực tiếp ở bảng trên, không cần suy diễn nữa.
+          4H thật hiện đang {trendVN[frames.H4.trend].toLowerCase()} (xem bảng
+          xu hướng đa khung ở trên — đó mới là số thật để ra quyết định).
+          Bảng này chỉ để kiểm tra thị trường có "tự đồng dạng" giữa các khung
+          lớn hay không — hữu ích khi ước lượng độ sâu một sóng thông thường,
+          không dùng để suy đoán 4H nữa vì đã có dữ liệu 4H thật.
         </div>
       </Panel>
 
@@ -12180,7 +12191,54 @@ function IntradayTab({ cfg, digits, state }) {
                 </b>
               </div>
             </div>
-            <p className="sub" style={{ margin: 0 }}>
+            <div
+              style={{
+                marginTop: 12,
+                padding: 12,
+                border: `1px solid ${CLR.line}`,
+                borderRadius: 10,
+              }}
+            >
+              <div className="sub" style={{ marginBottom: 8 }}>
+                Chẩn đoán SL — cấu trúc (swing hồi thật) so với ATR dự phòng
+                (khi không tìm được swing trong 80 nến 1H gần nhất)
+              </div>
+              <table className="tbl">
+                <thead>
+                  <tr>
+                    <th>Loại SL</th>
+                    <th>Số lệnh</th>
+                    <th>% dính SL</th>
+                    <th>% chạm TP</th>
+                    <th>R trung bình</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td>Cấu trúc (swing thật)</td>
+                    <td className="num">{model.stats.bySLSource.structural.n}</td>
+                    <td className="num">{model.stats.bySLSource.structural.slRate}%</td>
+                    <td className="num">{model.stats.bySLSource.structural.tpRate}%</td>
+                    <td className="num">{model.stats.bySLSource.structural.avgR}R</td>
+                  </tr>
+                  <tr>
+                    <td>ATR dự phòng (×1.5)</td>
+                    <td className="num">{model.stats.bySLSource.atr_fallback.n}</td>
+                    <td className="num">{model.stats.bySLSource.atr_fallback.slRate}%</td>
+                    <td className="num">{model.stats.bySLSource.atr_fallback.tpRate}%</td>
+                    <td className="num">{model.stats.bySLSource.atr_fallback.avgR}R</td>
+                  </tr>
+                </tbody>
+              </table>
+              <p className="sub" style={{ margin: "8px 0 0" }}>
+                Nếu nhóm "ATR dự phòng" chiếm phần lớn số lệnh VÀ có % dính SL
+                cao hơn hẳn nhóm "Cấu trúc" — nghĩa là cửa sổ 80 nến (~3.3 ngày)
+                tìm swing hồi đang quá ngắn, SL rơi về ATR×1.5 (sát) thường
+                xuyên hơn mong muốn. Hướng sửa: nới lookback tìm swing, hoặc
+                nới hệ số ATR dự phòng lên.
+              </p>
+            </div>
+            <p className="sub" style={{ margin: "12px 0 0" }}>
               Winrate/lệnh và winrate/nhịp thường lệch nhau: winrate/nhịp cao
               hơn vì dù 1-2 lệnh nhồi dính SL, cả nhịp vẫn có thể dương nhờ lệnh
               đầu ăn TP lớn. Với TP là mốc cấu trúc thật (không phải bội số R cố
