@@ -1,0 +1,32 @@
+name: Fetch screener data (Daily + Weekly OHLC)
+
+on:
+  schedule:
+    - cron: "30 22 * * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Fetch Twelve Data OHLC (D + W, 22 cặp)
+        env:
+          TWELVE_DATA_KEY: ${{ secrets.TWELVE_DATA_KEY }}
+        run: node scripts/fetch-screener-data.mjs
+
+      - name: Commit cache nếu có thay đổi
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add data/screener-data.json
+          git diff --staged --quiet || git commit -m "chore: cập nhật screener-data.json ($(date -u +%F))"
+          git push
