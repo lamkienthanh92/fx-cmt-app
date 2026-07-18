@@ -173,8 +173,19 @@ const fmtDateVN = (iso) => (iso ? iso.split("-").reverse().join("/") : "—");
    2. TẦNG DỮ LIỆU
    ============================================================ */
 
-async function fetchJSON(url) {
-  const res = await fetch(url, { cache: "no-store" });
+async function fetchJSON(url, timeoutMs = 20000) {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+  let res;
+  try {
+    res = await fetch(url, { cache: "no-store", signal: ctrl.signal });
+  } catch (e) {
+    if (e.name === "AbortError")
+      throw new Error(`Hết thời gian chờ phản hồi (>${timeoutMs / 1000}s) — có thể do mạng chậm/chập chờn`);
+    throw e;
+  } finally {
+    clearTimeout(timer);
+  }
   const text = await res.text();
   let j = null;
   try {
@@ -321,7 +332,7 @@ const TWELVE_DATA_KEY = "b59bf47f5e0b445184add85474954b03";
 const intradayCache = new Map();
 // 5 khung dùng xuyên suốt app — Tháng/Tuần/Ngày/4H/1H, tất cả đều OHLC thật.
 const TF_INTERVAL = { M: "1month", W: "1week", D: "1day", H4: "4h", H1: "1h" };
-const TF_OUTSIZE = { M: 240, W: 500, D: 2500, H4: 5000, H1: 5000 };
+const TF_OUTSIZE = { M: 240, W: 500, D: 2500, H4: 2500, H1: 2500 };
 // BULK: tải 1 lần cho CẢ 21 cặp (Screener) — chỉ Ngày+Tuần, đủ cho 2 bảng lọc
 // mà không phải kéo Tháng/4H/1H của 21 cặp cùng lúc (rất tốn credit/rate-limit).
 const TF_BULK = ["D", "W"];
@@ -534,9 +545,11 @@ async function loadBulkOHLC(onProgress, onSymbol) {
 }
 // Tải thêm Tháng/4H/1H cho MỘT cặp cụ thể (khi người dùng mở tab CMT/Hurst/
 // Intraday) — 3 request đơn lẻ, ghép với Ngày/Tuần đã có sẵn từ bulk.
-async function loadPairExtraOHLC(symbol) {
+async function loadPairExtraOHLC(symbol, onProgress) {
   const [M, H4, H1] = await Promise.all(
-    TF_PERPAIR.map((tf) => fetchTwelveOHLC(symbol, TF_INTERVAL[tf], TF_OUTSIZE[tf]))
+    TF_PERPAIR.map((tf) =>
+      fetchTwelveOHLC(symbol, TF_INTERVAL[tf], TF_OUTSIZE[tf], onProgress)
+    )
   );
   return { M, H4, H1 };
 }
@@ -12407,7 +12420,13 @@ export default function App() {
     if (pairExtra[sym]) return; // đã có (hoặc đang tải)
     setPairExtra((m) => ({ ...m, [sym]: { status: "loading" } }));
     let alive = true;
-    loadPairExtraOHLC(sym)
+    loadPairExtraOHLC(sym, (msg) => {
+      if (!alive) return;
+      setPairExtra((m) => ({
+        ...m,
+        [sym]: { ...(m[sym] || { status: "loading" }), note: msg },
+      }));
+    })
       .then(
         (d) =>
           alive &&
@@ -12750,7 +12769,10 @@ export default function App() {
           ) : (
             <>
               <div className="spin" />
-              <span>Đang tải Tháng/4H/1H cho {cfg ? cfg.label : ""}…</span>
+              <span>
+                {pairExtraStatus.note ||
+                  `Đang tải Tháng/4H/1H cho ${cfg ? cfg.label : ""}…`}
+              </span>
             </>
           )}
         </div>
