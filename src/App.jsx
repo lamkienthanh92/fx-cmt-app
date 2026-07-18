@@ -197,8 +197,14 @@ async function fetchJSON(url, timeoutMs = 20000) {
     res.status === 429 ||
     (j && (j.code === 429 || /run out of api credits|api rate limit/i.test(j.message || "")));
   if (rateLimited) {
-    const err = new Error((j && j.message) || "Twelve Data rate limit (429)");
-    err.rateLimited = true;
+    const dailyExhausted = /current day|per day|daily/i.test((j && j.message) || "");
+    const err = new Error(
+      dailyExhausted
+        ? `Đã hết hạn mức NGÀY của Twelve Data (${(j && j.message) || "day limit"}) — cần chờ tới khi hạn mức reset (thường 00:00 UTC), thử lại trong vài phút sẽ không có tác dụng.`
+        : (j && j.message) || "Twelve Data rate limit (429)"
+    );
+    err.rateLimited = !dailyExhausted; // hết hạn mức NGÀY thì retry ngắn hạn vô ích — không đánh dấu để khỏi retry
+    err.dailyExhausted = dailyExhausted;
     throw err;
   }
   if (!res.ok) throw new Error("HTTP " + res.status);
