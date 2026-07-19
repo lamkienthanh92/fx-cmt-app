@@ -3584,7 +3584,7 @@ function _medianTouchBars(bars, touchUp, aDist, H) {
 // Giải NGƯỢC: quét khoảng cách theo bội ATR, giữ mức lớn nhất còn P(chạm) >= threshold.
 function _highProbTarget(bars, feats, nowFeat, dirUp, mu, sigma, last, H, threshold = 0.9) {
   if (!sigma || sigma <= 0) return null;
-  let best = null;
+  let best = null, fb = null; // fb = mốc gần nhất tính được (dự phòng khi không mức nào đạt ngưỡng)
   for (let m = 0.25; m <= 6.001; m += 0.25) {
     const d = m * sigma;
     const p = _blendP(
@@ -3592,22 +3592,25 @@ function _highProbTarget(bars, feats, nowFeat, dirUp, mu, sigma, last, H, thresh
       { A: 0.4, B: 0.25, C: 0.35 }
     );
     if (p == null) continue;
+    if (fb == null) fb = { m, d, p };
     if (p >= threshold) best = { m, d, p };
     else if (best) break;
   }
-  if (!best) return null;
+  const pick = best || fb; // luôn có mốc nếu tính được ít nhất 1 khoảng cách (B luôn chạy khi có ATR)
+  if (!pick) return null;
   return {
-    level: dirUp ? last + best.d : last - best.d,
-    distPct: (best.d / last) * 100,
-    mult: +best.m.toFixed(2),
-    prob: Math.round(best.p * 100),
-    bars: _medianTouchBars(bars, dirUp, best.d, H),
+    level: dirUp ? last + pick.d : last - pick.d,
+    distPct: (pick.d / last) * 100,
+    mult: +pick.m.toFixed(2),
+    prob: Math.round(pick.p * 100),
+    bars: _medianTouchBars(bars, dirUp, pick.d, H),
+    below90: !best, // true nếu ngay cả mốc gần nhất cũng < 90% (rất hiếm; prob hiển thị nói thật)
   };
 }
 // Xác suất chạm TP pivot / R / S cho 1 cặp (blend A+B+C). Trả {pTP,pR,pS} theo % (0..100) hoặc null.
 function touchProbabilities(barsD, closes, rsiArr, mac, atr, R, S, last, bias, H) {
   const n = closes.length;
-  if (n < 80 || !atr[n - 1]) return { pTP: null, pR: null, pS: null };
+  if (n < 30 || !atr[n - 1]) return { pTP: null, pR: null, pS: null, t90: null };
   const sma20 = sma(closes, 20);
   const feats = barsD.map((b, i) =>
     i > 40 && atr[i]
