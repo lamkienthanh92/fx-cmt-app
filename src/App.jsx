@@ -1346,57 +1346,25 @@ function backtestLayered(
       const atr = atrArr[i];
       if (!atr) continue;
       const entry = bars1h[entryIdx].o;
-      // SL theo cấu trúc (swing hồi gần nhất) — hợp lý hơn cho lệnh nhắm TP đa-ngày;
-      // rơi về ATR×hệ số nếu không tìm được swing phù hợp hoặc swing nằm sai phía.
-      let sl = structuralStop(bars1h, piv1h, sig.dir, i, atr, 3, 80, 0.3);
+      // === CMT PULLBACK ===
+      // SL = swing low/high GẦN NHẤT (cấu trúc), KHÔNG dùng ATR. Không có swing hợp lệ → bỏ lệnh.
+      const sl = structuralStop(bars1h, piv1h, sig.dir, i, 0, 3, 80, 0);
       const validSide =
         sl != null && (sig.dir === "long" ? sl < entry : sl > entry);
-      const slSource = validSide ? "structural" : "atr_fallback";
-      if (!validSide)
-        sl = sig.dir === "long" ? entry - atr * atrMult : entry + atr * atrMult;
+      if (!validSide) continue;
+      const slSource = "structural";
       const risk = Math.abs(entry - sl);
       if (!risk) continue;
+      // TP = pivot NGÀY gần nhất theo hướng (chỉ Daily — KHÔNG Tuần, KHÔNG bội số R).
+      // Daily chưa có pivot phía trước → bỏ lệnh (đúng luật: chỉ vào khi daily có TP).
       const dIdx = dailyIdxFor1h[i];
-      const wIdx = weeklyIdxFor1h[i];
-      let tpInfo =
+      const tpInfo =
         dIdx != null && dIdx >= 0
-          ? nearestStructuralTarget(
-              dailyBars,
-              dailyPiv,
-              sig.dir,
-              dIdx,
-              entry,
-              3
-            )
+          ? nearestStructuralTarget(dailyBars, dailyPiv, sig.dir, dIdx, entry, 3)
           : null;
-      let tpSource = "daily";
-      if (!tpInfo || Math.abs(tpInfo.level - entry) / risk < minRR) {
-        const wTp =
-          wIdx != null && wIdx >= 0
-            ? nearestStructuralTarget(
-                weeklyBars,
-                weeklyPiv,
-                sig.dir,
-                wIdx,
-                entry,
-                2
-              )
-            : null;
-        if (wTp) {
-          tpInfo = wTp;
-          tpSource = "weekly";
-        }
-      }
-      let tp;
-      if (tpInfo && Math.abs(tpInfo.level - entry) / risk >= minRR) {
-        tp = tpInfo.level;
-      } else {
-        tp =
-          sig.dir === "long"
-            ? entry + risk * rrFallback
-            : entry - risk * rrFallback;
-        tpSource = "atr_fallback";
-      }
+      if (!tpInfo) continue;
+      const tp = tpInfo.level;
+      const tpSource = "daily";
       openPositions.push({
         dir: sig.dir,
         entry,
@@ -9219,9 +9187,9 @@ function IntradayTab({ cfg, digits, state }) {
       </Panel>
 
       <Panel
-        mod="Backtest · Bước 8"
-        title="Backtest theo ĐÚNG Bước 8 — cán cân bằng chứng + analog, không chỉ Dow D/W"
-        sub="Cùng engine 4H→1H (pullback, nhồi lệnh, SL/TP cấu trúc) như trên, nhưng hướng vào lệnh giờ lấy từ chuỗi Bước 8 tính lại nhân quả tại từng phiên Ngày quá khứ: Dow M/W/D + RSI + MACD + MA50/MA200 (rút gọn, bỏ Elliott/pattern/COT vì chủ quan hoặc quá tốn để chạy lại toàn lịch sử) × xác suất analog CAUSAL — chỉ ra hướng khi 2 nguồn đồng thuận (hoặc analog rất mạnh ≥60%)."
+        mod="CMT Pullback"
+        title="CMT Pullback — daily có xu hướng thì vào theo pullback 4H · SL = swing gần nhất · TP = pivot Ngày"
+        sub="Hướng lấy từ chuỗi Bước 8 (nhân quả) khi daily có xu hướng · Vào lệnh mỗi lần giá hồi (pullback) trên 4H · SL = swing low/high GẦN NHẤT (không dùng ATR) · TP = pivot Ngày gần nhất theo hướng · Thiếu swing hoặc chưa có pivot Ngày phía trước thì BỎ lệnh."
       >
         {step8Model && step8Model.stats ? (
           <>
