@@ -4759,11 +4759,14 @@ function StrategyModal({ row, onClose, onOpenCMT }) {
     const long = s.dir === "long";
     const entry = row.price;
     const sl = long ? row.S - row.range * 0.18 : row.R + row.range * 0.18;
-    const tp = s.tp1Y != null ? s.tp1Y : long ? row.R : row.S;
+    // TP = T90 (mốc ~90% giá chạm tới) nếu có; nếu không, mới rơi về pivot/tp1Y.
+    const useT90 = row.t90 && (long ? row.t90.level > entry : row.t90.level < entry);
+    const tp = useT90 ? row.t90.level : s.tp1Y != null ? s.tp1Y : long ? row.R : row.S;
     const rk = Math.abs(entry - sl), rw = Math.abs(tp - entry);
     const rr = rk > 0 ? rw / rk : 0;
-    const ok = rr >= 1.2 && (long ? tp > entry : tp < entry);
-    return { long, entry, sl, tp, rr, ok };
+    // T90 vốn gần → KHÔNG chặn theo RR; chỉ cần đúng hướng.
+    const ok = long ? tp > entry : tp < entry;
+    return { long, entry, sl, tp, rr, ok, useT90, t90prob: row.t90 ? row.t90.prob : null, t90bars: row.t90 ? row.t90.bars : null };
   })();
   const scenBar = (label, val, color) => (
     <div style={{ marginBottom: 6 }}>
@@ -4883,7 +4886,11 @@ function StrategyModal({ row, onClose, onOpenCMT }) {
                     <span className="num" style={{ color: CLR.amber }}>{fx(sug.sl)}</span>
                   </div>
                   <div className="kv" style={{ border: "none", padding: "2px 0" }}>
-                    <span>Chốt lời (TP1)</span>
+                    <span>
+                      {sug.useT90
+                        ? `Chốt lời — T90 (~${sug.t90prob}% chạm, ≈${sug.t90bars == null ? "?" : sug.t90bars} phiên)`
+                        : "Chốt lời (TP1)"}
+                    </span>
                     <span className="num" style={{ color: CLR.bull }}>{fx(sug.tp)}</span>
                   </div>
                   <div style={{ fontSize: 11.5, color: CLR.mut, marginTop: 6 }}>
