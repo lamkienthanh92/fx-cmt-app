@@ -1700,6 +1700,17 @@ function buildStep8LayeredModel(
     trades,
     stats,
     step8ActiveRate: evalN ? Math.round((activeN / evalN) * 100) : 0,
+    bars4h,
+    tradeMarks: trades.map((t) => ({
+      dir: t.dir,
+      entryT: bars1h[t.entryIdx] ? bars1h[t.entryIdx].t : null,
+      exitT: bars1h[t.exitIdx] ? bars1h[t.exitIdx].t : null,
+      entryPrice: t.entry,
+      exitPrice: bars1h[t.exitIdx] ? bars1h[t.exitIdx].c : t.entry,
+      r: t.r,
+      outcome: t.outcome,
+      isAddon: t.isAddon,
+    })),
     step8Meta,
     lastBarDaily: dailyBars[dailyBars.length - 1],
     lastBarWeekly: weeklyBars[weeklyBars.length - 1],
@@ -4588,6 +4599,17 @@ function StrategyModal({ row, onClose, onOpenCMT }) {
     Math.min(100, ((row.price - row.S) / (row.range || 1e-9)) * 100)
   );
   const dm = DIR_META[s.dir] || DIR_META.wait;
+  const sug = (() => {
+    if (!s || (s.dir !== "long" && s.dir !== "short")) return null;
+    const long = s.dir === "long";
+    const entry = row.price;
+    const sl = long ? row.S - row.range * 0.18 : row.R + row.range * 0.18;
+    const tp = s.tp1Y != null ? s.tp1Y : long ? row.R : row.S;
+    const rk = Math.abs(entry - sl), rw = Math.abs(tp - entry);
+    const rr = rk > 0 ? rw / rk : 0;
+    const ok = rr >= 1.2 && (long ? tp > entry : tp < entry);
+    return { long, entry, sl, tp, rr, ok };
+  })();
   const scenBar = (label, val, color) => (
     <div style={{ marginBottom: 6 }}>
       <div
@@ -4679,6 +4701,51 @@ function StrategyModal({ row, onClose, onOpenCMT }) {
         </div>
 
         <div style={{ padding: 18 }}>
+          {sug && (
+            <div
+              style={{
+                marginBottom: 14,
+                padding: 12,
+                borderRadius: 10,
+                border: `1px solid ${sug.ok ? (sug.long ? CLR.bull : CLR.bear) : CLR.line}`,
+                background: "rgba(255,255,255,.02)",
+              }}
+            >
+              <div style={{ fontSize: 10.5, letterSpacing: ".12em", textTransform: "uppercase", color: CLR.dim, marginBottom: 6 }}>
+                Đề nghị vào lệnh
+              </div>
+              {sug.ok ? (
+                <>
+                  <div style={{ fontWeight: 800, color: sug.long ? CLR.bull : CLR.bear, marginBottom: 6 }}>
+                    {sug.long ? "MUA" : "BÁN"} · R:R ≈ {sug.rr.toFixed(1)}
+                  </div>
+                  <div className="kv" style={{ border: "none", padding: "2px 0" }}>
+                    <span>Vùng vào (tham chiếu)</span>
+                    <span className="num">{fx(sug.entry)}</span>
+                  </div>
+                  <div className="kv" style={{ border: "none", padding: "2px 0" }}>
+                    <span>Dừng lỗ</span>
+                    <span className="num" style={{ color: CLR.amber }}>{fx(sug.sl)}</span>
+                  </div>
+                  <div className="kv" style={{ border: "none", padding: "2px 0" }}>
+                    <span>Chốt lời (TP1)</span>
+                    <span className="num" style={{ color: CLR.bull }}>{fx(sug.tp)}</span>
+                  </div>
+                  <div style={{ fontSize: 11.5, color: CLR.mut, marginTop: 6 }}>
+                    Khi nào vào:{" "}
+                    {sug.long
+                      ? `chờ giá bật lên từ hỗ trợ và ĐÓNG một nến ${row.tfScale === "W" ? "Ngày" : "4H"} xanh trên ${fx(row.S)}`
+                      : `chờ giá bị đẩy xuống từ kháng cự và ĐÓNG một nến ${row.tfScale === "W" ? "Ngày" : "4H"} đỏ dưới ${fx(row.R)}`}
+                    {" "}rồi mới vào; nếu giá đi ngược qua Dừng lỗ thì huỷ kèo.
+                  </div>
+                </>
+              ) : (
+                <div style={{ fontSize: 12, color: CLR.mut }}>
+                  Chưa thuận lợi để vào (tỷ lệ lời/lỗ thấp hoặc chưa rõ hướng) — đứng ngoài, chờ giá về gần hỗ trợ/kháng cự cho R:R tốt hơn.
+                </div>
+              )}
+            </div>
+          )}
           {/* Vị trí giá trong biên */}
           <div style={{ marginBottom: 14 }}>
             <div
@@ -6579,6 +6646,75 @@ function RiskLayer({
 /* ============================================================
    15. CMT — LỚP 6: KỊCH BẢN GIAO DỊCH
    ============================================================ */
+
+// Lịch sử vào/thoát lệnh vẽ TRÊN chart giá 4H (không chỉ thống kê).
+// entry: chấm đặc (xanh=Mua, đỏ=Bán) · exit: vòng tròn viền (xanh=lời, đỏ=lỗ) · nối entry→exit bằng nét đứt.
+function TradeHistoryChart4H({ bars4h, marks, digits }) {
+  if (!bars4h || bars4h.length < 5) return null;
+  const N = Math.min(260, bars4h.length);
+  const off = bars4h.length - N;
+  const view = bars4h.slice(off);
+  const data = view.map((b, i) => ({ x: i, c: b.c }));
+  const fmt = (v) => (v == null ? "\u2014" : Number(v).toFixed(digits));
+  const idxForT = (ts) => {
+    if (ts == null) return null;
+    let ans = null;
+    for (let i = 0; i < view.length; i++) {
+      if (view[i].t <= ts) ans = i;
+      else break;
+    }
+    return ans;
+  };
+  const entries = [], exits = [], links = [];
+  (marks || []).forEach((m) => {
+    const ex = idxForT(m.entryT);
+    if (ex == null) return;
+    entries.push({ x: ex, y: m.entryPrice, dir: m.dir });
+    const xx = idxForT(m.exitT);
+    if (xx != null) {
+      const win = m.r > 0;
+      exits.push({ x: xx, y: m.exitPrice, win });
+      links.push({ x1: ex, y1: m.entryPrice, x2: xx, y2: m.exitPrice, win });
+    }
+  });
+  const ys = view.map((b) => b.c);
+  const yMin = Math.min(...ys), yMax = Math.max(...ys);
+  const pad = (yMax - yMin) * 0.08 || 1;
+  return (
+    <ResponsiveContainer width="100%" height={320}>
+      <ComposedChart data={data} margin={{ top: 8, right: 8, bottom: 0, left: 0 }}>
+        <CartesianGrid stroke={CLR.line} strokeDasharray="2 4" vertical={false} />
+        <XAxis dataKey="x" type="number" domain={[0, view.length - 1]} hide />
+        <YAxis
+          domain={[yMin - pad, yMax + pad]}
+          tick={{ fill: CLR.dim, fontSize: 10, fontFamily: "IBM Plex Mono" }}
+          tickFormatter={fmt}
+          width={64}
+          tickLine={false}
+          axisLine={false}
+          orientation="right"
+        />
+        <Tooltip contentStyle={TT} labelFormatter={() => ""} formatter={(v) => [fmt(v), "Gia 4H"]} />
+        {links.map((l, i) => (
+          <ReferenceLine
+            key={"lk" + i}
+            segment={[{ x: l.x1, y: l.y1 }, { x: l.x2, y: l.y2 }]}
+            stroke={l.win ? CLR.bull : CLR.bear}
+            strokeOpacity={0.45}
+            strokeDasharray="3 3"
+          />
+        ))}
+        <Line dataKey="c" name="Gia 4H" stroke={CLR.blue} dot={false} strokeWidth={1.5} isAnimationActive={false} />
+        {entries.map((e, i) => (
+          <ReferenceDot key={"en" + i} x={e.x} y={e.y} r={5} fill={e.dir === "long" ? CLR.bull : CLR.bear} stroke="#0b1020" strokeWidth={1} />
+        ))}
+        {exits.map((e, i) => (
+          <ReferenceDot key={"ex" + i} x={e.x} y={e.y} r={4} fill="none" stroke={e.win ? CLR.bull : CLR.bear} strokeWidth={1.6} />
+        ))}
+      </ComposedChart>
+    </ResponsiveContainer>
+  );
+}
 
 function PlaybookChart({ dates, closes, digits, pb, ma50, ma200 }) {
   const n = Math.min(130, closes.length),
@@ -9083,172 +9219,18 @@ function IntradayTab({ cfg, digits, state }) {
       </Panel>
 
       <Panel
-        mod="Backtest"
-        title="Backtest thật trên OHLC — có nhồi lệnh, TP theo cấu trúc Ngày/Tuần"
-        sub="Vào lệnh ở giá MỞ nến 1H kế tiếp sau tín hiệu · SL theo ATR(14) 1H · TP là đỉnh/đáy Ngày (hoặc Tuần nếu mốc Ngày quá gần) còn nguyên vẹn · SL & TP cùng chạm 1 nến thì tính THUA."
-      >
-        {model.stats ? (
-          <>
-            <div
-              style={{
-                display: "flex",
-                gap: 18,
-                flexWrap: "wrap",
-                marginBottom: 10,
-              }}
-            >
-              <div>
-                <div className="sub">Số lệnh</div>
-                <b>{model.stats.n}</b>
-              </div>
-              <div>
-                <div className="sub">Winrate</div>
-                <b
-                  style={{
-                    color: model.stats.winRate >= 50 ? CLR.bull : CLR.bear,
-                  }}
-                >
-                  {model.stats.winRate}%
-                </b>
-              </div>
-              <div>
-                <div className="sub">R trung bình/lệnh</div>
-                <b
-                  style={{ color: model.stats.avgR >= 0 ? CLR.bull : CLR.bear }}
-                >
-                  {model.stats.avgR}R
-                </b>
-              </div>
-              <div>
-                <div className="sub">Profit factor</div>
-                <b>{model.stats.pf}</b>
-              </div>
-              <div>
-                <div className="sub">Long / Short</div>
-                <b>
-                  {model.stats.long} / {model.stats.short}
-                </b>
-              </div>
-              <div>
-                <div className="sub">Chạm TP / SL / Hết hạn</div>
-                <b>
-                  {model.stats.tp} / {model.stats.sl} / {model.stats.timeout}
-                </b>
-              </div>
-            </div>
-            <div
-              style={{
-                display: "flex",
-                gap: 18,
-                flexWrap: "wrap",
-                marginBottom: 10,
-              }}
-            >
-              <div>
-                <div className="sub">Tỷ lệ lệnh nhồi</div>
-                <b>
-                  {model.stats.addonRate}% ({model.stats.addon} lệnh)
-                </b>
-              </div>
-              <div>
-                <div className="sub">Số nhịp xu hướng có giao dịch</div>
-                <b>{model.stats.clusters}</b>
-              </div>
-              <div>
-                <div className="sub">
-                  Winrate theo NHỊP (cả cụm nhồi lệnh cộng dồn)
-                </div>
-                <b
-                  style={{
-                    color:
-                      model.stats.clusterWinRate >= 50 ? CLR.bull : CLR.bear,
-                  }}
-                >
-                  {model.stats.clusterWinRate}%
-                </b>
-              </div>
-              <div>
-                <div className="sub">TB lệnh/nhịp</div>
-                <b>{model.stats.avgAddonPerCluster}</b>
-              </div>
-              <div>
-                <div className="sub">TP theo Ngày / Tuần / ATR dự phòng</div>
-                <b>
-                  {model.stats.bySource.daily || 0} /{" "}
-                  {model.stats.bySource.weekly || 0} /{" "}
-                  {model.stats.bySource.atr_fallback || 0}
-                </b>
-              </div>
-            </div>
-            <div
-              style={{
-                marginTop: 12,
-                padding: 12,
-                border: `1px solid ${CLR.line}`,
-                borderRadius: 10,
-              }}
-            >
-              <div className="sub" style={{ marginBottom: 8 }}>
-                Chẩn đoán SL — cấu trúc (swing hồi thật) so với ATR dự phòng
-                (khi không tìm được swing trong 80 nến 1H gần nhất)
-              </div>
-              <table className="tbl">
-                <thead>
-                  <tr>
-                    <th>Loại SL</th>
-                    <th>Số lệnh</th>
-                    <th>% dính SL</th>
-                    <th>% chạm TP</th>
-                    <th>R trung bình</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  <tr>
-                    <td>Cấu trúc (swing thật)</td>
-                    <td className="num">{model.stats.bySLSource.structural.n}</td>
-                    <td className="num">{model.stats.bySLSource.structural.slRate}%</td>
-                    <td className="num">{model.stats.bySLSource.structural.tpRate}%</td>
-                    <td className="num">{model.stats.bySLSource.structural.avgR}R</td>
-                  </tr>
-                  <tr>
-                    <td>ATR dự phòng (×1.5)</td>
-                    <td className="num">{model.stats.bySLSource.atr_fallback.n}</td>
-                    <td className="num">{model.stats.bySLSource.atr_fallback.slRate}%</td>
-                    <td className="num">{model.stats.bySLSource.atr_fallback.tpRate}%</td>
-                    <td className="num">{model.stats.bySLSource.atr_fallback.avgR}R</td>
-                  </tr>
-                </tbody>
-              </table>
-              <p className="sub" style={{ margin: "8px 0 0" }}>
-                Nếu nhóm "ATR dự phòng" chiếm phần lớn số lệnh VÀ có % dính SL
-                cao hơn hẳn nhóm "Cấu trúc" — nghĩa là cửa sổ 80 nến (~3.3 ngày)
-                tìm swing hồi đang quá ngắn, SL rơi về ATR×1.5 (sát) thường
-                xuyên hơn mong muốn. Hướng sửa: nới lookback tìm swing, hoặc
-                nới hệ số ATR dự phòng lên.
-              </p>
-            </div>
-            <p className="sub" style={{ margin: "12px 0 0" }}>
-              Winrate/lệnh và winrate/nhịp thường lệch nhau: winrate/nhịp cao
-              hơn vì dù 1-2 lệnh nhồi dính SL, cả nhịp vẫn có thể dương nhờ lệnh
-              đầu ăn TP lớn. Với TP là mốc cấu trúc thật (không phải bội số R cố
-              định), tỷ lệ đạt TP thực tế thường rơi vào khoảng 70–85% chứ không
-              cao ảo như khi backtest trên Close-only.
-            </p>
-          </>
-        ) : (
-          <Warn>
-            Chưa đủ tín hiệu trong dữ liệu hiện có để backtest có ý nghĩa.
-          </Warn>
-        )}
-      </Panel>
-
-      <Panel
         mod="Backtest · Bước 8"
         title="Backtest theo ĐÚNG Bước 8 — cán cân bằng chứng + analog, không chỉ Dow D/W"
         sub="Cùng engine 4H→1H (pullback, nhồi lệnh, SL/TP cấu trúc) như trên, nhưng hướng vào lệnh giờ lấy từ chuỗi Bước 8 tính lại nhân quả tại từng phiên Ngày quá khứ: Dow M/W/D + RSI + MACD + MA50/MA200 (rút gọn, bỏ Elliott/pattern/COT vì chủ quan hoặc quá tốn để chạy lại toàn lịch sử) × xác suất analog CAUSAL — chỉ ra hướng khi 2 nguồn đồng thuận (hoặc analog rất mạnh ≥60%)."
       >
         {step8Model && step8Model.stats ? (
           <>
+            <div style={{ marginBottom: 14 }}>
+              <div className="sub" style={{ margin: "0 0 6px" }}>
+                Lịch sử vào/thoát lệnh trên khung 4H — chấm xanh: vào Mua · chấm đỏ: vào Bán · vòng tròn viền: điểm thoát (xanh = lời, đỏ = lỗ).
+              </div>
+              <TradeHistoryChart4H bars4h={step8Model.bars4h} marks={step8Model.tradeMarks} digits={digits} />
+            </div>
             <div
               style={{
                 display: "flex",
