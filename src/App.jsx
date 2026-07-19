@@ -1543,6 +1543,87 @@ function buildLayeredModel(dailyBars, weeklyBars, bars4h, bars1h, opts = {}) {
   };
 }
 
+// Backtest "ĐÚNG BƯỚC 8": thay vì lọc hướng chỉ bằng Dow D/W thuần (buildLayeredModel
+// ở trên), dùng chuỗi hướng NHÂN QUẢ đã kết hợp cán cân bằng chứng + xác suất analog
+// (buildStep8DirectionSeries) làm bộ lọc hướng cho đúng engine 4H→1H (pullback + nhồi
+// lệnh + SL/TP cấu trúc) đã có — tái dùng generateLayeredSignals1h/backtestLayered
+// nguyên xi, chỉ đổi nguồn "hướng Daily". Weekly đã nằm trong cán cân bằng chứng của
+// Bước 8 rồi nên không lọc lại lần 2 (truyền "side" để vô hiệu hoá gate đó).
+function buildStep8LayeredModel(
+  dailyBars,
+  weeklyBars,
+  monthlyBars,
+  bars4h,
+  bars1h,
+  opts = {}
+) {
+  const { dir: step8Dir, meta: step8Meta } = buildStep8DirectionSeries(
+    dailyBars,
+    weeklyBars,
+    monthlyBars,
+    opts.analogHorizon ?? 20
+  );
+  const dailyPiv = pivotsOHLC(dailyBars, 3);
+  const weeklyPiv = pivotsOHLC(weeklyBars, 2);
+  const piv1h = pivotsOHLC(bars1h, 3);
+
+  const dailyIdxFor1h = indexAlignPointer(bars1h, dailyBars);
+  const weeklyIdxFor1h = indexAlignPointer(bars1h, weeklyBars);
+  const dailyTrendAligned1h = dailyIdxFor1h.map((j) =>
+    j >= 0 ? step8Dir[j] : "side"
+  );
+  const weeklyTrendAligned1h = new Array(bars1h.length).fill("side");
+
+  const zoneFlags4h = pullbackZoneFlags4h(
+    bars4h,
+    20,
+    opts.pullbackZoneAtrMult ?? 1.2
+  );
+  const pullbackActive1h = pullbackWindowFlags1h(bars1h, bars4h, zoneFlags4h);
+
+  const signals = generateLayeredSignals1h(
+    bars1h,
+    dailyTrendAligned1h,
+    weeklyTrendAligned1h,
+    pullbackActive1h
+  );
+  const trades = backtestLayered(
+    bars1h,
+    signals,
+    piv1h,
+    dailyBars,
+    dailyPiv,
+    weeklyBars,
+    weeklyPiv,
+    dailyIdxFor1h,
+    weeklyIdxFor1h,
+    dailyTrendAligned1h,
+    opts
+  );
+  const stats = summarizeLayeredTrades(trades);
+
+  // Đếm số phiên Ngày mà Bước 8 thật sự ra hướng (up/down) trên tổng số phiên có đủ
+  // dữ liệu — để biết engine này "rảnh tay" bao lâu so với việc lọc chỉ bằng Dow D/W.
+  const evalStart = 210;
+  const evalEnd = step8Dir.length - (opts.analogHorizon ?? 20) - 1;
+  const evalN = Math.max(0, evalEnd - evalStart);
+  const activeN = step8Dir
+    .slice(evalStart, evalEnd)
+    .filter((d) => d !== "side").length;
+
+  return {
+    signals,
+    trades,
+    stats,
+    step8ActiveRate: evalN ? Math.round((activeN / evalN) * 100) : 0,
+    step8Meta,
+    lastBarDaily: dailyBars[dailyBars.length - 1],
+    lastBarWeekly: weeklyBars[weeklyBars.length - 1],
+    lastBar1h: bars1h[bars1h.length - 1],
+    lastBar4h: bars4h[bars4h.length - 1],
+  };
+}
+
 // Cổng "lệnh" theo khung Tuần/Tháng — dùng xu hướng Dow (đỉnh/đáy) của chính khung đó,
 // KHÔNG dùng breakout biên riêng. Khác cổng D (breakout 40 phiên): đây là cảnh báo MỀM —
 // mỗi khung vẫn ra lệnh độc lập, chỉ gắn cờ conflict khi khung con đi ngược khung mẹ
@@ -2488,7 +2569,9 @@ function analogForwardStats(bars, states, sessions = [3, 4, 5]) {
 }
 
 // Analog CAUSAL: xác suất A/B/C của trạng thái TẠI bar asOf, chỉ đếm các lần khớp trong QUÁ KHỨ (i < asOf-horizon).
-function analogAt(closes, states, asOf, horizon = 20) {
+function analogAt(bars, states, asOf, horizon = 20) {
+  const highs = bars.map((b) => b.h);
+  const lows = bars.map((b) => b.l);
   const cs = states[asOf];
   if (!cs) return null;
   const dimSets = [
@@ -2513,11 +2596,11 @@ function analogAt(closes, states, asOf, horizon = 20) {
         const st = states[i];
         let res = "c";
         for (let j = i + 1; j <= i + horizon; j++) {
-          if (closes[j] > st.R) {
+          if (highs[j] > st.R) {
             res = "a";
             break;
           }
-          if (closes[j] < st.S) {
+          if (lows[j] < st.S) {
             res = "b";
             break;
           }
@@ -2538,6 +2621,72 @@ function analogAt(closes, states, asOf, horizon = 20) {
     }
   }
   return null;
+}
+
+// ------------------------------------------------------------
+// "BƯỚC 8" NHÂN QUẢ — tại MỖI phiên Ngày trong quá khứ, tính lại đúng logic
+// "Nhánh nào đang được đề nghị" như SummaryLayer đang hiển thị cho HIỆN TẠI:
+// cán cân bằng chứng (rút gọn — chỉ phần khách quan tính rẻ: Dow M/W/D, RSI,
+// MACD, MA50/MA200 — KHÔNG gồm Elliott/pattern/COT vì chủ quan hoặc quá tốn
+// để tính lại ở mọi điểm lịch sử) × xác suất analog CAUSAL (chỉ đếm khớp
+// TRƯỚC thời điểm đó). Ra "up"/"down" chỉ khi 2 nguồn đó ĐỒNG THUẬN (hoặc
+// analog rất mạnh ≥60%) — y hệt luật ở "Tổng hợp · Kế hoạch chính".
+function buildStep8DirectionSeries(dailyBars, weeklyBars, monthlyBars, horizon = 20) {
+  const closes = dailyBars.map((b) => b.c);
+  const n = closes.length;
+  const rsiArr = rsi(closes),
+    macdArr = macd(closes);
+  const ma50 = sma(closes, 50),
+    ma200 = sma(closes, 200);
+  const trendD = buildTrendSeriesOHLC(dailyBars, 4, 4);
+  const trendWraw = buildTrendSeriesOHLC(weeklyBars, 2, 2);
+  const trendMraw = buildTrendSeriesOHLC(monthlyBars, 2, 2);
+  const wPtr = indexAlignPointer(dailyBars, weeklyBars);
+  const mPtr = indexAlignPointer(dailyBars, monthlyBars);
+  const trendW = wPtr.map((j) => (j >= 0 ? trendWraw[j] : "side"));
+  const trendM = mPtr.map((j) => (j >= 0 ? trendMraw[j] : "side"));
+
+  const states = buildStates(dailyBars);
+
+  const dir = new Array(n).fill("side"); // "up" | "down" | "side" (side = wait/range, không vào lệnh)
+  const meta = new Array(n).fill(null);
+  for (let i = 210; i < n - horizon - 1; i++) {
+    const bull = [
+      trendM[i] === "up",
+      trendW[i] === "up",
+      trendD[i] === "up",
+      ma50[i] != null && closes[i] > ma50[i],
+      ma50[i] != null && ma200[i] != null && ma50[i] > ma200[i],
+      rsiArr[i] != null && rsiArr[i] > 50,
+      macdArr[i].hist > 0,
+    ].filter(Boolean).length;
+    const bear = [
+      trendM[i] === "down",
+      trendW[i] === "down",
+      trendD[i] === "down",
+      ma50[i] != null && closes[i] < ma50[i],
+      ma50[i] != null && ma200[i] != null && ma50[i] < ma200[i],
+      rsiArr[i] != null && rsiArr[i] < 50,
+      macdArr[i].hist < 0,
+    ].filter(Boolean).length;
+    const biasPct = Math.round((bull / (bull + bear || 1)) * 100);
+    const bias = biasPct >= 60 ? "up" : biasPct <= 40 ? "down" : "side";
+
+    const an = analogAt(dailyBars, states, i, horizon);
+    if (!an) continue;
+    const maxP = Math.max(an.pA, an.pB, an.pC);
+    const probBranch = maxP === an.pA ? "up" : maxP === an.pB ? "down" : "side";
+    const agree = probBranch === bias;
+
+    // Luật giống hệt "Tổng hợp · Kế hoạch chính": đồng thuận (không phải C) và
+    // đủ mạnh ≥45%, HOẶC analog một mình đã rất mạnh ≥60% dù bias chưa đồng ý.
+    let d = "side";
+    if (agree && probBranch !== "side" && maxP >= 45) d = probBranch;
+    else if (maxP >= 60 && probBranch !== "side") d = probBranch;
+    dir[i] = d;
+    meta[i] = { biasPct, bias, an, agree };
+  }
+  return { dir, meta };
 }
 
 function backtestSystem(closes) {
@@ -8750,7 +8899,7 @@ function buildCMTModel(barsByTF, dxySeries, vixSeries, cot, seas, cfg) {
    ============================================================ */
 
 function IntradayTab({ cfg, digits, state }) {
-  const { status, error, model, symbol, opts, setOpts } = state;
+  const { status, error, model, step8Model, symbol, opts, setOpts } = state;
   const fx = (v) => (v == null ? "—" : Number(v).toFixed(digits));
   if (status === "err")
     return (
@@ -9030,6 +9179,156 @@ function IntradayTab({ cfg, digits, state }) {
         ) : (
           <Warn>
             Chưa đủ tín hiệu trong dữ liệu hiện có để backtest có ý nghĩa.
+          </Warn>
+        )}
+      </Panel>
+
+      <Panel
+        mod="Backtest · Bước 8"
+        title="Backtest theo ĐÚNG Bước 8 — cán cân bằng chứng + analog, không chỉ Dow D/W"
+        sub="Cùng engine 4H→1H (pullback, nhồi lệnh, SL/TP cấu trúc) như trên, nhưng hướng vào lệnh giờ lấy từ chuỗi Bước 8 tính lại nhân quả tại từng phiên Ngày quá khứ: Dow M/W/D + RSI + MACD + MA50/MA200 (rút gọn, bỏ Elliott/pattern/COT vì chủ quan hoặc quá tốn để chạy lại toàn lịch sử) × xác suất analog CAUSAL — chỉ ra hướng khi 2 nguồn đồng thuận (hoặc analog rất mạnh ≥60%)."
+      >
+        {step8Model && step8Model.stats ? (
+          <>
+            <div
+              style={{
+                display: "flex",
+                gap: 8,
+                flexWrap: "wrap",
+                marginBottom: 12,
+              }}
+            >
+              <Chip cls="mut">
+                Bước 8 ra hướng ở {step8Model.step8ActiveRate}% số phiên Ngày
+                (còn lại là chờ/kẹt biên — không vào lệnh)
+              </Chip>
+            </div>
+            <div
+              style={{
+                display: "flex",
+                gap: 18,
+                flexWrap: "wrap",
+                marginBottom: 12,
+              }}
+            >
+              <div>
+                <div className="sub">Số lệnh</div>
+                <b>{step8Model.stats.n}</b>
+              </div>
+              <div>
+                <div className="sub">Winrate</div>
+                <b>{step8Model.stats.winRate}%</b>
+              </div>
+              <div>
+                <div className="sub">R trung bình/lệnh</div>
+                <b>{step8Model.stats.avgR}R</b>
+              </div>
+              <div>
+                <div className="sub">Profit factor</div>
+                <b>{step8Model.stats.pf}</b>
+              </div>
+              <div>
+                <div className="sub">Long / Short</div>
+                <b>
+                  {step8Model.stats.long} / {step8Model.stats.short}
+                </b>
+              </div>
+              <div>
+                <div className="sub">Chạm TP / SL / Hết hạn</div>
+                <b>
+                  {step8Model.stats.tp} / {step8Model.stats.sl} /{" "}
+                  {step8Model.stats.timeout}
+                </b>
+              </div>
+              <div>
+                <div className="sub">Tỷ lệ lệnh nhồi</div>
+                <b>
+                  {step8Model.stats.addonRate}% ({step8Model.stats.addon} lệnh)
+                </b>
+              </div>
+              <div>
+                <div className="sub">Số nhịp có giao dịch</div>
+                <b>{step8Model.stats.clusters}</b>
+              </div>
+              <div>
+                <div className="sub">Winrate theo NHỊP</div>
+                <b>{step8Model.stats.clusterWinRate}%</b>
+              </div>
+              <div>
+                <div className="sub">TP theo Ngày / Tuần / ATR dự phòng</div>
+                <b>
+                  {step8Model.stats.bySource.daily || 0} /{" "}
+                  {step8Model.stats.bySource.weekly || 0} /{" "}
+                  {step8Model.stats.bySource.atr_fallback || 0}
+                </b>
+              </div>
+            </div>
+            <div
+              style={{
+                padding: 12,
+                border: `1px solid ${CLR.line}`,
+                borderRadius: 10,
+              }}
+            >
+              <div className="sub" style={{ marginBottom: 8 }}>
+                Chẩn đoán SL — cấu trúc so với ATR dự phòng
+              </div>
+              <table className="tbl">
+                <thead>
+                  <tr>
+                    <th>Loại SL</th>
+                    <th>Số lệnh</th>
+                    <th>% dính SL</th>
+                    <th>% chạm TP</th>
+                    <th>R trung bình</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td>Cấu trúc (swing thật)</td>
+                    <td className="num">
+                      {step8Model.stats.bySLSource.structural.n}
+                    </td>
+                    <td className="num">
+                      {step8Model.stats.bySLSource.structural.slRate}%
+                    </td>
+                    <td className="num">
+                      {step8Model.stats.bySLSource.structural.tpRate}%
+                    </td>
+                    <td className="num">
+                      {step8Model.stats.bySLSource.structural.avgR}R
+                    </td>
+                  </tr>
+                  <tr>
+                    <td>ATR dự phòng (×1.5)</td>
+                    <td className="num">
+                      {step8Model.stats.bySLSource.atr_fallback.n}
+                    </td>
+                    <td className="num">
+                      {step8Model.stats.bySLSource.atr_fallback.slRate}%
+                    </td>
+                    <td className="num">
+                      {step8Model.stats.bySLSource.atr_fallback.tpRate}%
+                    </td>
+                    <td className="num">
+                      {step8Model.stats.bySLSource.atr_fallback.avgR}R
+                    </td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+            <p className="sub" style={{ margin: "12px 0 0" }}>
+              So sánh với bảng "Backtest thật trên OHLC" ở trên (chỉ lọc bằng
+              Dow D/W thuần) để biết cán cân bằng chứng + analog có thật sự
+              cộng giá trị hay không trên đúng cặp này — nếu 2 bảng gần như
+              giống nhau hoặc bảng này TỆ hơn, nghĩa là phần "Bước 8" (rút
+              gọn) chưa chứng minh được có ích cho việc lọc hướng vào lệnh.
+            </p>
+          </>
+        ) : (
+          <Warn>
+            Chưa đủ dữ liệu (cần đủ nến Tháng/Tuần/Ngày/4H/1H) để chạy backtest
+            Bước 8.
           </Warn>
         )}
       </Panel>
@@ -9341,7 +9640,14 @@ export default function App() {
   const intradaySymbol = cfg ? tdSymbol(cfg) : null;
   const pdOpen = fullPairData(cfg);
   const intradayEntry = pdOpen
-    ? { status: "ok", d1: pdOpen.D, w1: pdOpen.W, h4: pdOpen.H4, h1: pdOpen.H1 }
+    ? {
+        status: "ok",
+        m1: pdOpen.M,
+        d1: pdOpen.D,
+        w1: pdOpen.W,
+        h4: pdOpen.H4,
+        h1: pdOpen.H1,
+      }
     : pairExtraStatus.status === "err"
     ? { status: "err", error: pairExtraStatus.error }
     : { status: "loading" };
@@ -9350,6 +9656,17 @@ export default function App() {
     return buildLayeredModel(
       intradayEntry.d1,
       intradayEntry.w1,
+      intradayEntry.h4,
+      intradayEntry.h1,
+      intradayOpts
+    );
+  }, [intradayEntry, intradayOpts]);
+  const step8Model = useMemo(() => {
+    if (!intradayEntry || intradayEntry.status !== "ok") return null;
+    return buildStep8LayeredModel(
+      intradayEntry.d1,
+      intradayEntry.w1,
+      intradayEntry.m1,
       intradayEntry.h4,
       intradayEntry.h1,
       intradayOpts
@@ -9971,6 +10288,7 @@ export default function App() {
               status: intradayEntry ? intradayEntry.status : "loading",
               error: intradayEntry ? intradayEntry.error : null,
               model: intradayModel,
+              step8Model,
               symbol: intradaySymbol,
               opts: intradayOpts,
               setOpts: setIntradayOpts,
