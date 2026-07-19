@@ -1601,6 +1601,127 @@ function buildLayeredModel(dailyBars, weeklyBars, bars4h, bars1h, opts = {}) {
 // lệnh + SL/TP cấu trúc) đã có — tái dùng generateLayeredSignals1h/backtestLayered
 // nguyên xi, chỉ đổi nguồn "hướng Daily". Weekly đã nằm trong cán cân bằng chứng của
 // Bước 8 rồi nên không lọc lại lần 2 (truyền "side" để vô hiệu hoá gate đó).
+// ============================================================
+// BACKTEST T90 — 4 tổ hợp: {1H,4H} vào × {Ngày,Tuần} làm mục tiêu T90.
+// Vào: pullback về EMA20 khung vào + đóng nến quay lại theo trend (Dow) khung target.
+// TP = T90 tính CAUSAL trên khung target (chỉ dữ liệu tới lúc vào). SL = swing gần nhất khung vào.
+// R chuẩn theo rủi ro tới SL. Không lookahead. Đã kiểm chứng cơ chế bằng Node.
+// ============================================================
+function _pEmpTouchCausal(bars, jEnd, touchUp, d, H) {
+  let hit = 0, n = 0;
+  for (let i = 50; i < jEnd - 1; i++) {
+    const e = bars[i].c, lvl = touchUp ? e + d : e - d, last = Math.min(jEnd, i + H);
+    let h = false;
+    for (let k = i + 1; k <= last; k++) { if (touchUp ? bars[k].h >= lvl : bars[k].l <= lvl) { h = true; break; } }
+    if (h) hit++;
+    n++;
+  }
+  return n >= 15 ? hit / n : null;
+}
+function _t90AtIndex(bars, atr, closes, j, dirUp, H, thr) {
+  const sig = atr[j];
+  if (!sig || sig <= 0) return null;
+  let mu = 0, c = 0;
+  for (let i = Math.max(1, j - 100); i <= j; i++) { mu += closes[i] - closes[i - 1]; c++; }
+  mu = c ? mu / c : 0;
+  let best = null, fb = null;
+  for (let m = 0.25; m <= 6.001; m += 0.25) {
+    const d = m * sig;
+    const pA = _pEmpTouchCausal(bars, j, dirUp, d, H), pB = _pBarrierTouch(d, dirUp, mu, sig, H);
+    let w = 0, pp = 0;
+    if (pA != null) { pp += 0.6 * pA; w += 0.6; }
+    if (pB != null) { pp += 0.4 * pB; w += 0.4; }
+    const p = w > 0 ? pp / w : null;
+    if (p == null) continue;
+    if (fb == null) fb = { d };
+    if (p >= thr) best = { d };
+    else if (best) break;
+  }
+  const pick = best || fb;
+  return pick ? pick.d : null;
+}
+function _nearestSwingTF(bars, idx, dirUp, look, confirm) {
+  for (let i = idx - confirm - 1; i >= Math.max(1, idx - look); i--) {
+    if (i + 1 >= bars.length) continue;
+    const isLow = bars[i].l <= bars[i - 1].l && bars[i].l <= bars[i + 1].l;
+    const isHigh = bars[i].h >= bars[i - 1].h && bars[i].h >= bars[i + 1].h;
+    if (dirUp && isLow) return bars[i].l;
+    if (!dirUp && isHigh) return bars[i].h;
+  }
+  return null;
+}
+function backtestT90Combo(barsEntry, barsTarget, opts) {
+  const H = (opts && opts.H) || 20, maxHold = (opts && opts.maxHold) || 200, thr = 0.9;
+  if (!barsEntry || !barsTarget || barsEntry.length < 120 || barsTarget.length < 80) return { n: 0 };
+  const closesE = barsEntry.map((b) => b.c), emaE = ema(closesE, 20);
+  const closesT = barsTarget.map((b) => b.c), atrT = atrOHLC(barsTarget, 14);
+  const trendT = buildTrendSeriesOHLC(barsTarget, 3, 3);
+  const cache = new Map();
+  let j = 0, freeAt = 0;
+  const trades = [];
+  for (let i = 50; i < barsEntry.length - 1; i++) {
+    while (j + 1 < barsTarget.length && barsTarget[j + 1].t <= barsEntry[i].t) j++;
+    const dir = trendT[j];
+    if (dir === "side") continue;
+    const dirUp = dir === "up";
+    const pulled = dirUp ? closesE[i - 1] <= emaE[i - 1] : closesE[i - 1] >= emaE[i - 1];
+    const resumed = dirUp ? closesE[i] > emaE[i] : closesE[i] < emaE[i];
+    if (!pulled || !resumed || i < freeAt) continue;
+    const entryIdx = i + 1, entry = barsEntry[entryIdx].o;
+    const sl = _nearestSwingTF(barsEntry, entryIdx, dirUp, 40, 2);
+    if (sl == null || (dirUp ? sl >= entry : sl <= entry)) continue;
+    const risk = Math.abs(entry - sl);
+    if (!risk) continue;
+    const key = dirUp + "|" + j;
+    let dist = cache.get(key);
+    if (dist === undefined) { dist = _t90AtIndex(barsTarget, atrT, closesT, j, dirUp, H, thr); cache.set(key, dist); }
+    if (!dist) continue;
+    const tp = dirUp ? entry + dist : entry - dist;
+    if (dirUp ? tp <= entry : tp >= entry) continue;
+    const last = Math.min(barsEntry.length - 1, entryIdx + maxHold - 1);
+    let outcome = "timeout", exitIdx = last, exit = barsEntry[last].c;
+    for (let k = entryIdx; k <= last; k++) {
+      const b = barsEntry[k];
+      if (dirUp ? b.l <= sl : b.h >= sl) { outcome = "sl"; exitIdx = k; exit = sl; break; }
+      if (dirUp ? b.h >= tp : b.l <= tp) { outcome = "tp"; exitIdx = k; exit = tp; break; }
+    }
+    const r = (dirUp ? exit - entry : entry - exit) / risk;
+    trades.push({ r, outcome, hold: exitIdx - entryIdx });
+    freeAt = exitIdx + 1;
+  }
+  return _t90Metrics(trades);
+}
+function _t90Metrics(tr) {
+  if (!tr.length) return { n: 0 };
+  const R = tr.map((t) => t.r), wins = R.filter((x) => x > 0);
+  const gw = wins.reduce((a, b) => a + b, 0), gl = Math.abs(R.filter((x) => x <= 0).reduce((a, b) => a + b, 0));
+  let eq = 0, pk = 0, dd = 0;
+  R.forEach((x) => { eq += x; pk = Math.max(pk, eq); dd = Math.max(dd, pk - eq); });
+  return {
+    n: tr.length,
+    win: Math.round((wins.length / tr.length) * 100),
+    tpHit: Math.round((tr.filter((t) => t.outcome === "tp").length / tr.length) * 100),
+    slHit: Math.round((tr.filter((t) => t.outcome === "sl").length / tr.length) * 100),
+    to: Math.round((tr.filter((t) => t.outcome === "timeout").length / tr.length) * 100),
+    avgR: +(R.reduce((a, b) => a + b, 0) / tr.length).toFixed(3),
+    pf: gl ? +(gw / gl).toFixed(2) : Infinity,
+    totR: +eq.toFixed(1),
+    maxDD: +dd.toFixed(1),
+    avgHold: Math.round(tr.reduce((a, t) => a + t.hold, 0) / tr.length),
+  };
+}
+function runT90Backtest(entry) {
+  if (!entry || entry.status !== "ok") return null;
+  return {
+    combos: [
+      { name: "1H → T90 Ngày", m: backtestT90Combo(entry.h1, entry.d1, { maxHold: 300 }) },
+      { name: "4H → T90 Ngày", m: backtestT90Combo(entry.h4, entry.d1, { maxHold: 150 }) },
+      { name: "1H → T90 Tuần", m: backtestT90Combo(entry.h1, entry.w1, { maxHold: 400 }) },
+      { name: "4H → T90 Tuần", m: backtestT90Combo(entry.h4, entry.w1, { maxHold: 200 }) },
+    ],
+  };
+}
+
 function buildStep8LayeredModel(
   dailyBars,
   weeklyBars,
@@ -9389,7 +9510,7 @@ function buildCMTModel(barsByTF, dxySeries, vixSeries, cot, seas, cfg) {
    ============================================================ */
 
 function IntradayTab({ cfg, digits, state }) {
-  const { status, error, model, step8Model, symbol, opts, setOpts } = state;
+  const { status, error, model, step8Model, t90Bt, symbol, opts, setOpts } = state;
   const fx = (v) => (v == null ? "—" : Number(v).toFixed(digits));
   if (status === "err")
     return (
@@ -9513,6 +9634,62 @@ function IntradayTab({ cfg, digits, state }) {
         )}
       </Panel>
 
+      {t90Bt && (
+        <Panel
+          mod="Backtest T90"
+          title="Backtest theo mục tiêu T90 — 1H/4H × T90 Ngày/Tuần"
+          sub="Vào: pullback về EMA20 khung vào + đóng nến quay lại theo trend (Dow) khung target · TP = T90 tính causal trên khung target · SL = swing gần nhất khung vào · R chuẩn theo rủi ro tới SL. Chạm T90% = tỉ lệ lệnh chạm mục tiêu."
+        >
+          <div style={{ overflowX: "auto" }}>
+            <table className="tbl">
+              <thead>
+                <tr>
+                  <th>Tổ hợp</th>
+                  <th>Số lệnh</th>
+                  <th>Win%</th>
+                  <th>Chạm T90%</th>
+                  <th>Dính SL%</th>
+                  <th>Hết hạn%</th>
+                  <th>R TB/lệnh</th>
+                  <th>PF</th>
+                  <th>Tổng R</th>
+                  <th>MaxDD (R)</th>
+                  <th>Giữ TB (nến)</th>
+                </tr>
+              </thead>
+              <tbody>
+                {t90Bt.combos.map((c, i) =>
+                  c.m.n ? (
+                    <tr key={i}>
+                      <td style={{ fontWeight: 700 }}>{c.name}</td>
+                      <td className="num">{c.m.n}</td>
+                      <td className="num">{c.m.win}%</td>
+                      <td className="num" style={{ color: CLR.bull }}>{c.m.tpHit}%</td>
+                      <td className="num" style={{ color: CLR.bear }}>{c.m.slHit}%</td>
+                      <td className="num">{c.m.to}%</td>
+                      <td className="num" style={{ color: c.m.avgR >= 0 ? CLR.bull : CLR.bear }}>{c.m.avgR}R</td>
+                      <td className="num">{c.m.pf === Infinity ? "∞" : c.m.pf}</td>
+                      <td className="num" style={{ color: c.m.totR >= 0 ? CLR.bull : CLR.bear }}>{c.m.totR}R</td>
+                      <td className="num" style={{ color: CLR.amber }}>{c.m.maxDD}R</td>
+                      <td className="num">{c.m.avgHold}</td>
+                    </tr>
+                  ) : (
+                    <tr key={i}>
+                      <td style={{ fontWeight: 700 }}>{c.name}</td>
+                      <td className="num" colSpan={10} style={{ color: CLR.dim }}>
+                        không đủ dữ liệu / không có lệnh
+                      </td>
+                    </tr>
+                  )
+                )}
+              </tbody>
+            </table>
+          </div>
+          <p className="sub" style={{ marginTop: 8 }}>
+            T90 Ngày = TP gần → tỉ lệ chạm cao nhưng R nhỏ; T90 Tuần = TP xa → chạm ít hơn nhưng R lớn khi trúng. So Win% ↔ R TB ↔ PF để chọn tổ hợp hợp gu.
+          </p>
+        </Panel>
+      )}
       <Panel
         mod="CMT Pullback"
         title="CMT Pullback — daily có xu hướng thì vào theo pullback 4H · SL = swing gần nhất · TP = pivot Ngày"
@@ -10008,6 +10185,8 @@ export default function App() {
       intradayOpts
     );
   }, [intradayEntry, intradayOpts]);
+
+  const t90Bt = useMemo(() => runT90Backtest(intradayEntry), [intradayEntry]);
 
   // Nạp COT lười cho cặp đang chọn (theo 2 chân đồng tiền)
   useEffect(() => {
@@ -10625,6 +10804,7 @@ export default function App() {
               error: intradayEntry ? intradayEntry.error : null,
               model: intradayModel,
               step8Model,
+              t90Bt,
               symbol: intradaySymbol,
               opts: intradayOpts,
               setOpts: setIntradayOpts,
