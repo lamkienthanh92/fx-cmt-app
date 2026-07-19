@@ -3769,7 +3769,11 @@ function screenPair(cfg, pd, opts) {
   // cậy) càng phản ánh dư địa lãi/rủi ro thật, không chỉ điểm cao suông.
   const fibPick =
     bias === "down" ? fibTargets?.down : bias === "up" ? fibTargets?.up : null;
-  const fibScore = fibPick ? Math.min(100, fibPick.mult * 50) : 0;
+  const fibScore = fibPick
+    ? Math.min(100, fibPick.mult * 50)
+    : _tp.t90
+    ? Math.min(100, _tp.t90.mult * 50)
+    : 0;
   const score = Math.round(
     0.2 * evi +
       0.2 * (prob ?? 50) +
@@ -5380,9 +5384,6 @@ function ScreenerSection({ rows, openPair, scope = "fast" }) {
                 <th>Bằng chứng</th>
                 <th>W / {secondTFLabel}</th>
                 <th>Analog A·B·C</th>
-                <th title="Mức Fibonacci/pivot XA NHẤT theo hướng bằng chứng hiện tại mà lịch sử vẫn chạm được ≥90% trong ~60 phiên (xem chi tiết ở tab Phân tích CMT)">
-                  Mục tiêu tối ưu (≥90%)
-                </th>
                 <th>Lịch sử đạt T1</th>
                 <th title="Khoảng cách theo hướng bias tới mức cần ĐÓNG CỬA phá qua để vào lệnh breakout (Long→R, Short→S). Đây là mức dùng để tính điểm CMT.">
                   Trigger breakout
@@ -5391,7 +5392,7 @@ function ScreenerSection({ rows, openPair, scope = "fast" }) {
                   Trigger pullback
                 </th>
                 <th title="Xác suất giá CHẠM mục tiêu — blend Lịch sử + Mô hình biến động + Analog CMT. Thứ tự: TP · R · S.">P chạm (TP·R·S)</th>
-                <th title="T90 — mức XA NHẤT mà ~90% lịch sử vẫn chạm tới trong ~20 phiên (biên độ + thời gian). Mục tiêu chốt lời gần chắc ăn.">T90 (90% chạm)</th>
+                <th title="Mục tiêu tối ưu ≥90%: mức XA NHẤT mà ~90% lịch sử vẫn CHẠM tới trong ~20 phiên (biên độ + thời gian). Quét liên tục nên cặp nào cũng có.">Mục tiêu ≥90% (T90)</th>
                 <th>Vol/{barUnit}</th>
                 <th>Điểm CMT</th>
                 <th></th>
@@ -5500,29 +5501,6 @@ function ScreenerSection({ rows, openPair, scope = "fast" }) {
                       </>
                     ) : (
                       "—"
-                    )}
-                  </td>
-                  <td className="num">
-                    {r.fibTargets && r.fibTargets[r.bias] ? (
-                      <span
-                        style={{
-                          color: r.bias === "up" ? CLR.bull : CLR.bear,
-                        }}
-                        title={`= ${r.bias === "up" ? "R" : "S"} ${
-                          r.bias === "up" ? "+" : "−"
-                        } ${r.fibTargets[r.bias].mult.toFixed(
-                          1
-                        )}× biên · trung vị ${
-                          r.fibTargets[r.bias].medianDays ?? "—"
-                        } phiên để chạm`}
-                      >
-                        {r.fibTargets[r.bias].price.toFixed(r.digits)} (
-                        {r.fibTargets[r.bias].hitRatePct}%)
-                      </span>
-                    ) : r.bias === "side" ? (
-                      <span style={{ color: CLR.dim }}>đi ngang</span>
-                    ) : (
-                      <span style={{ color: CLR.dim }}>không đủ tin cậy</span>
                     )}
                   </td>
                   <td className="num">
