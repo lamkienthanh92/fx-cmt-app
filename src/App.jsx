@@ -3471,6 +3471,181 @@ function quickPullbackBacktest(closes, dir, atr, slMult, riskPct) {
       8%  Đồng thuận đa khung W & D
    ============================================================ */
 
+// ============================================================
+// P(touch) — xác suất giá CHẠM mốc (TP pivot / R / S), blend A+B+C:
+//   A empirical (lịch sử cặp) · B first-passage (mô hình biến động) · C analog CMT.
+// Trả 0..1. Đã kiểm chứng bằng Node (up→P(TP) mua cao, down→P(TP) bán cao, range→thấp).
+// ============================================================
+function _ncdf(x) {
+  const tt = 1 / (1 + 0.2316419 * Math.abs(x));
+  const d = 0.3989422804014327 * Math.exp((-x * x) / 2);
+  const p = d * tt * (0.31938153 + tt * (-0.356563782 + tt * (1.781477937 + tt * (-1.821255978 + tt * 1.330274429))));
+  return x >= 0 ? 1 - p : p;
+}
+function _fwdTwoBarrier(bars, startIdx, dirUp, aDist, bDist, H) {
+  const entry = bars[startIdx].c;
+  const tpLvl = dirUp ? entry + aDist : entry - aDist;
+  const slLvl = dirUp ? entry - bDist : entry + bDist;
+  const last = Math.min(bars.length - 1, startIdx + H);
+  for (let k = startIdx + 1; k <= last; k++) {
+    const b = bars[k];
+    if (dirUp) { if (b.l <= slLvl) return "sl"; if (b.h >= tpLvl) return "tp"; }
+    else { if (b.h >= slLvl) return "sl"; if (b.l <= tpLvl) return "tp"; }
+  }
+  return "none";
+}
+function _fwdTouch(bars, startIdx, touchUp, aDist, H) {
+  const entry = bars[startIdx].c;
+  const lvl = touchUp ? entry + aDist : entry - aDist;
+  const last = Math.min(bars.length - 1, startIdx + H);
+  for (let k = startIdx + 1; k <= last; k++) {
+    if (touchUp ? bars[k].h >= lvl : bars[k].l <= lvl) return true;
+  }
+  return false;
+}
+function _pEmpTwo(bars, dirUp, aDist, bDist, H, minN = 15) {
+  let tp = 0, n = 0;
+  for (let i = 50; i < bars.length - 2; i++) {
+    const r = _fwdTwoBarrier(bars, i, dirUp, aDist, bDist, H);
+    if (r === "tp") tp++;
+    n++;
+  }
+  return n >= minN ? tp / n : null;
+}
+function _pEmpTouch(bars, touchUp, aDist, H, minN = 15) {
+  let hit = 0, n = 0;
+  for (let i = 50; i < bars.length - 2; i++) { if (_fwdTouch(bars, i, touchUp, aDist, H)) hit++; n++; }
+  return n >= minN ? hit / n : null;
+}
+function _pBarrierTwo(aDist, bDist, mu, sigma) {
+  if (aDist <= 0 || bDist <= 0 || sigma <= 0) return null;
+  const v = sigma * sigma;
+  if (Math.abs(mu) < 1e-9) return bDist / (aDist + bDist);
+  const num = 1 - Math.exp((-2 * mu * bDist) / v);
+  const den = 1 - Math.exp((-2 * mu * (aDist + bDist)) / v);
+  return Math.max(0, Math.min(1, num / den));
+}
+function _pBarrierTouch(aDist, touchUp, mu, sigma, H) {
+  if (aDist <= 0 || sigma <= 0 || H <= 0) return null;
+  const s = sigma * Math.sqrt(H), m = mu * H, v = sigma * sigma;
+  let p;
+  if (touchUp) p = _ncdf((-aDist + m) / s) + Math.exp((2 * mu * aDist) / v) * _ncdf((-aDist - m) / s);
+  else p = _ncdf((-aDist - m) / s) + Math.exp((-2 * mu * aDist) / v) * _ncdf((-aDist + m) / s);
+  return Math.max(0, Math.min(1, p));
+}
+function _pAnalogTwo(bars, feats, nowFeat, dirUp, aDist, bDist, H, K = 60, minN = 12) {
+  if (!nowFeat) return null;
+  const scored = [];
+  for (let i = 50; i < bars.length - 2; i++) {
+    const f = feats[i]; if (!f) continue;
+    let d = 0; for (let j = 0; j < nowFeat.length; j++) { const x = f[j] - nowFeat[j]; d += x * x; }
+    scored.push({ i, d });
+  }
+  scored.sort((p, q) => p.d - q.d);
+  const top = scored.slice(0, K);
+  let tp = 0, n = 0;
+  for (const s of top) { if (_fwdTwoBarrier(bars, s.i, dirUp, aDist, bDist, H) === "tp") tp++; n++; }
+  return n >= minN ? tp / n : null;
+}
+function _blendP(parts, weights) {
+  let w = 0, p = 0;
+  for (const k of Object.keys(parts)) {
+    const v = parts[k];
+    if (v == null || isNaN(v)) continue;
+    p += weights[k] * v; w += weights[k];
+  }
+  return w > 0 ? p / w : null;
+}
+function _pAnalogTouch(bars, feats, nowFeat, touchUp, aDist, H, K = 60, minN = 12) {
+  if (!nowFeat) return null;
+  const scored = [];
+  for (let i = 50; i < bars.length - 2; i++) {
+    const f = feats[i]; if (!f) continue;
+    let d = 0; for (let j = 0; j < nowFeat.length; j++) { const x = f[j] - nowFeat[j]; d += x * x; }
+    scored.push({ i, d });
+  }
+  scored.sort((p, q) => p.d - q.d);
+  let hit = 0, n = 0;
+  for (const s of scored.slice(0, K)) { if (_fwdTouch(bars, s.i, touchUp, aDist, H)) hit++; n++; }
+  return n >= minN ? hit / n : null;
+}
+function _medianTouchBars(bars, touchUp, aDist, H) {
+  const times = [];
+  for (let i = 50; i < bars.length - 2; i++) {
+    const entry = bars[i].c, lvl = touchUp ? entry + aDist : entry - aDist;
+    const last = Math.min(bars.length - 1, i + H);
+    for (let k = i + 1; k <= last; k++) { if (touchUp ? bars[k].h >= lvl : bars[k].l <= lvl) { times.push(k - i); break; } }
+  }
+  if (!times.length) return null;
+  times.sort((a, b) => a - b);
+  return times[Math.floor(times.length / 2)];
+}
+// T90 "90-point": mức XA NHẤT mà ~90% lịch sử vẫn CHẠM tới trong H phiên (biên độ + thời gian).
+// Giải NGƯỢC: quét khoảng cách theo bội ATR, giữ mức lớn nhất còn P(chạm) >= threshold.
+function _highProbTarget(bars, feats, nowFeat, dirUp, mu, sigma, last, H, threshold = 0.9) {
+  if (!sigma || sigma <= 0) return null;
+  let best = null;
+  for (let m = 0.25; m <= 6.001; m += 0.25) {
+    const d = m * sigma;
+    const p = _blendP(
+      { A: _pEmpTouch(bars, dirUp, d, H), B: _pBarrierTouch(d, dirUp, mu, sigma, H), C: _pAnalogTouch(bars, feats, nowFeat, dirUp, d, H) },
+      { A: 0.4, B: 0.25, C: 0.35 }
+    );
+    if (p == null) continue;
+    if (p >= threshold) best = { m, d, p };
+    else if (best) break;
+  }
+  if (!best) return null;
+  return {
+    level: dirUp ? last + best.d : last - best.d,
+    distPct: (best.d / last) * 100,
+    mult: +best.m.toFixed(2),
+    prob: Math.round(best.p * 100),
+    bars: _medianTouchBars(bars, dirUp, best.d, H),
+  };
+}
+// Xác suất chạm TP pivot / R / S cho 1 cặp (blend A+B+C). Trả {pTP,pR,pS} theo % (0..100) hoặc null.
+function touchProbabilities(barsD, closes, rsiArr, mac, atr, R, S, last, bias, H) {
+  const n = closes.length;
+  if (n < 80 || !atr[n - 1]) return { pTP: null, pR: null, pS: null };
+  const sma20 = sma(closes, 20);
+  const feats = barsD.map((b, i) =>
+    i > 40 && atr[i]
+      ? [
+          (closes[i] - closes[i - 40]) / (40 * atr[i]),
+          sma20[i] != null ? (closes[i] - sma20[i]) / atr[i] : 0,
+          ((rsiArr[i] ?? 50) - 50) / 50,
+          Math.sign(mac[i] ? mac[i].hist : 0),
+        ]
+      : null
+  );
+  const nowFeat = feats[n - 1];
+  let mu = 0, c = 0;
+  for (let i = Math.max(1, n - 100); i < n; i++) { mu += closes[i] - closes[i - 1]; c++; }
+  mu = c ? mu / c : 0;
+  const sigma = atr[n - 1] || last * 0.005;
+  const dirUp = bias !== "down";
+  const aTP = Math.max(dirUp ? R - last : last - S, sigma * 0.05);
+  const bSL = Math.max(dirUp ? last - S : R - last, sigma * 0.05);
+  const dR = Math.max(R - last, sigma * 0.05);
+  const dS = Math.max(last - S, sigma * 0.05);
+  const pct = (x) => (x == null ? null : Math.round(x * 100));
+  const pTP = pct(
+    _blendP(
+      {
+        A: _pEmpTwo(barsD, dirUp, aTP, bSL, H),
+        B: _pBarrierTwo(aTP, bSL, dirUp ? mu : -mu, sigma),
+        C: _pAnalogTwo(barsD, feats, nowFeat, dirUp, aTP, bSL, H),
+      },
+      { A: 0.4, B: 0.25, C: 0.35 }
+    )
+  );
+  const pR = pct(_blendP({ A: _pEmpTouch(barsD, true, dR, H), B: _pBarrierTouch(dR, true, mu, sigma, H) }, { A: 0.55, B: 0.45 }));
+  const pS = pct(_blendP({ A: _pEmpTouch(barsD, false, dS, H), B: _pBarrierTouch(dS, false, mu, sigma, H) }, { A: 0.55, B: 0.45 }));
+  const t90 = _highProbTarget(barsD, feats, nowFeat, dirUp, mu, sigma, last, H, 0.9);
+  return { pTP, pR, pS, t90 };
+}
+
 function screenPair(cfg, pd, opts) {
   const barsD = pd.D;
   const closes = barsD.map((b) => b.c);
@@ -3544,6 +3719,7 @@ function screenPair(cfg, pd, opts) {
   const rule = scanBreakoutRule(closes);
   const atr = atrOHLC(barsD, opts.atrPeriod);
   const volPct = ((atr[n - 1] ?? 0) / last) * 100;
+  const _tp = touchProbabilities(barsD, closes, rsiArr, mac, atr, R, S, last, bias, opts.probH || 20);
   const qb = quickPullbackBacktest(
     closes,
     bias === "down" ? "short" : "long",
@@ -3611,6 +3787,10 @@ function screenPair(cfg, pd, opts) {
     pip: cfg.pip,
     price: last,
     tfScale: "D",
+    pTP: _tp.pTP,
+    pR: _tp.pR,
+    pS: _tp.pS,
+    t90: _tp.t90,
     tM,
     tW,
     tD,
@@ -4721,6 +4901,55 @@ function StrategyModal({ row, onClose, onOpenCMT }) {
               )}
             </div>
           )}
+          {row.pTP != null && (
+            <div style={{ marginBottom: 14, display: "flex", gap: 16, flexWrap: "wrap" }}>
+              <div>
+                <div className="sub" style={{ margin: 0 }}>P chạm TP</div>
+                <div
+                  className="num"
+                  style={{
+                    fontSize: 20,
+                    fontWeight: 800,
+                    color: row.pTP >= 60 ? CLR.bull : row.pTP >= 40 ? CLR.amber : CLR.bear,
+                  }}
+                >
+                  {row.pTP}%
+                </div>
+              </div>
+              <div>
+                <div className="sub" style={{ margin: 0 }}>P chạm R</div>
+                <div className="num" style={{ fontSize: 18, fontWeight: 700 }}>{row.pR == null ? "—" : row.pR + "%"}</div>
+              </div>
+              <div>
+                <div className="sub" style={{ margin: 0 }}>P chạm S</div>
+                <div className="num" style={{ fontSize: 18, fontWeight: 700 }}>{row.pS == null ? "—" : row.pS + "%"}</div>
+              </div>
+            </div>
+          )}
+          {row.t90 && (
+            <div
+              style={{
+                marginBottom: 14,
+                padding: 12,
+                borderRadius: 10,
+                border: `1px solid ${CLR.bull}`,
+                background: "rgba(63,214,164,.06)",
+              }}
+            >
+              <div className="sub" style={{ margin: "0 0 4px" }}>
+                T90 — mục tiêu ~90% giá sẽ CHẠM tới (≈{row.t90.bars == null ? "?" : row.t90.bars} phiên)
+              </div>
+              <div className="num" style={{ fontSize: 19, fontWeight: 800, color: CLR.bull }}>
+                {fx(row.t90.level)}{" "}
+                <span style={{ fontSize: 12, color: CLR.dim, fontWeight: 600 }}>
+                  ({row.t90.distPct.toFixed(2)}% · {row.t90.mult}·ATR · P={row.t90.prob}%)
+                </span>
+              </div>
+              <div style={{ fontSize: 11.5, color: CLR.mut, marginTop: 5 }}>
+                Mức gần-chắc-ăn để chốt (một phần) trước khi giá có thể quay đầu — thường tới trước T1/pivot.
+              </div>
+            </div>
+          )}
           {/* Vị trí giá trong biên */}
           <div style={{ marginBottom: 14 }}>
             <div
@@ -4971,7 +5200,8 @@ function StrategyModal({ row, onClose, onOpenCMT }) {
 }
 
 function ScreenerSection({ rows, openPair, scope = "fast" }) {
-  const [sortKey, setSortKey] = useState("score");
+  const [sortKey, setSortKey] = useState("ptp");
+  const [onlyHighP, setOnlyHighP] = useState(true);
   const [onlyRunning, setOnlyRunning] = useState(false);
   const [stratRow, setStratRow] = useState(null);
   const isStrategic = scope === "strategic";
@@ -4987,7 +5217,9 @@ function ScreenerSection({ rows, openPair, scope = "fast" }) {
           x.state === "RUN_DOWN" ||
           x.state === "NEAR_TRIGGER"
       );
+    if (onlyHighP) r = r.filter((x) => x.pTP == null || x.pTP >= 60);
     const get = {
+      ptp: (x) => x.pTP ?? -1,
       score: (x) => x.score,
       prob: (x) => x.prob ?? 0,
       evi: (x) => Math.abs(x.biasPct - 50),
@@ -4996,7 +5228,7 @@ function ScreenerSection({ rows, openPair, scope = "fast" }) {
       fib: (x) => x.fibScore ?? 0,
     };
     return r.sort((a, b) => get[sortKey](b) - get[sortKey](a));
-  }, [rows, sortKey, onlyRunning]);
+  }, [rows, sortKey, onlyRunning, onlyHighP]);
   const top = view[0];
   const dirC = (b) => (b === "up" ? "up" : b === "down" ? "down" : "side");
   const dirT = (b) =>
@@ -5084,6 +5316,7 @@ function ScreenerSection({ rows, openPair, scope = "fast" }) {
                 }}
               >
                 {[
+                  ["ptp", "P(chạm TP)"],
                   ["score", "Điểm CMT"],
                   ["prob", "Xác suất"],
                   ["evi", "Bằng chứng"],
@@ -5105,6 +5338,15 @@ function ScreenerSection({ rows, openPair, scope = "fast" }) {
                   </button>
                 ))}
               </div>
+              <button
+                className="bt"
+                onClick={() => setOnlyHighP(!onlyHighP)}
+                style={
+                  onlyHighP ? { borderColor: CLR.bull, color: CLR.text } : {}
+                }
+              >
+                {onlyHighP ? "Đang lọc P(TP) ≥ 60%" : "Lọc P(chạm TP) ≥ 60%"}
+              </button>
               <button
                 className="bt"
                 onClick={() => setOnlyRunning(!onlyRunning)}
@@ -5141,6 +5383,8 @@ function ScreenerSection({ rows, openPair, scope = "fast" }) {
                 <th title="Khoảng cách ngược lại — mức hồi về để vào lệnh pullback (Long→S, Short→R). Chỉ tham khảo, không tính điểm.">
                   Trigger pullback
                 </th>
+                <th title="Xác suất giá CHẠM mục tiêu — blend Lịch sử + Mô hình biến động + Analog CMT. Thứ tự: TP · R · S.">P chạm (TP·R·S)</th>
+                <th title="T90 — mức XA NHẤT mà ~90% lịch sử vẫn chạm tới trong ~20 phiên (biên độ + thời gian). Mục tiêu chốt lời gần chắc ăn.">T90 (90% chạm)</th>
                 <th>Vol/{barUnit}</th>
                 <th>Điểm CMT</th>
                 <th></th>
@@ -5286,6 +5530,38 @@ function ScreenerSection({ rows, openPair, scope = "fast" }) {
                     {r.distPullbackPct != null
                       ? `${r.distPullbackPct.toFixed(2)}%`
                       : "—"}
+                  </td>
+                  <td className="num">
+                    <div style={{ display: "flex", gap: 5, fontWeight: 700, whiteSpace: "nowrap" }}>
+                      <span
+                        style={{
+                          color:
+                            r.pTP == null
+                              ? CLR.dim
+                              : r.pTP >= 60
+                              ? CLR.bull
+                              : r.pTP >= 40
+                              ? CLR.amber
+                              : CLR.bear,
+                        }}
+                      >
+                        {r.pTP == null ? "—" : r.pTP + "%"}
+                      </span>
+                      <span style={{ color: CLR.line }}>·</span>
+                      <span style={{ color: CLR.dim }} title="P chạm R">{r.pR == null ? "—" : r.pR}</span>
+                      <span style={{ color: CLR.line }}>/</span>
+                      <span style={{ color: CLR.dim }} title="P chạm S">{r.pS == null ? "—" : r.pS}</span>
+                    </div>
+                  </td>
+                  <td className="num">
+                    {r.t90 ? (
+                      <span style={{ whiteSpace: "nowrap" }}>
+                        <span style={{ fontWeight: 700, color: CLR.bull }}>{r.t90.level.toFixed(r.digits)}</span>
+                        <span style={{ color: CLR.dim }}> · {r.t90.distPct.toFixed(2)}% · ~{r.t90.bars == null ? "?" : r.t90.bars}p</span>
+                      </span>
+                    ) : (
+                      "—"
+                    )}
                   </td>
                   <td className="num">{r.volPct.toFixed(2)}%</td>
                   <td>
