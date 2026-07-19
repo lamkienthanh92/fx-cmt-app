@@ -3582,6 +3582,36 @@ function _medianTouchBars(bars, touchUp, aDist, H) {
 }
 // T90 "90-point": mức XA NHẤT mà ~90% lịch sử vẫn CHẠM tới trong H phiên (biên độ + thời gian).
 // Giải NGƯỢC: quét khoảng cách theo bội ATR, giữ mức lớn nhất còn P(chạm) >= threshold.
+function _pctFromTimes(times, pct) {
+  if (!times || !times.length) return null;
+  times.sort((a, b) => a - b);
+  const idx = Math.min(times.length - 1, Math.max(0, Math.ceil(pct * times.length) - 1));
+  return { t: times[idx], n: times.length };
+}
+// Time90 toàn lịch sử: phân vị `pct` của số nến-để-chạm, CHỈ trong các lần ĐÃ chạm aDist trong H.
+function _touchTimeAll(bars, touchUp, aDist, H, pct = 0.9) {
+  const times = [];
+  for (let i = 50; i < bars.length - 2; i++) {
+    const entry = bars[i].c, lvl = touchUp ? entry + aDist : entry - aDist;
+    const last = Math.min(bars.length - 1, i + H);
+    for (let k = i + 1; k <= last; k++) { if (touchUp ? bars[k].h >= lvl : bars[k].l <= lvl) { times.push(k - i); break; } }
+  }
+  return _pctFromTimes(times, pct);
+}
+// Time90 analog: như trên nhưng chỉ trên K phiên GIỐNG hiện tại (đúng "trong điều kiện đó").
+function _touchTimeAnalog(bars, feats, nowFeat, touchUp, aDist, H, pct = 0.9, K = 60) {
+  if (!nowFeat) return null;
+  const scored = [];
+  for (let i = 50; i < bars.length - 2; i++) { const f = feats[i]; if (!f) continue; let d = 0; for (let j = 0; j < nowFeat.length; j++) { const x = f[j] - nowFeat[j]; d += x * x; } scored.push({ i, d }); }
+  scored.sort((p, q) => p.d - q.d);
+  const times = [];
+  for (const s of scored.slice(0, K)) {
+    const i = s.i, entry = bars[i].c, lvl = touchUp ? entry + aDist : entry - aDist;
+    const last = Math.min(bars.length - 1, i + H);
+    for (let k = i + 1; k <= last; k++) { if (touchUp ? bars[k].h >= lvl : bars[k].l <= lvl) { times.push(k - i); break; } }
+  }
+  return _pctFromTimes(times, pct);
+}
 function _highProbTarget(bars, feats, nowFeat, dirUp, mu, sigma, last, H, threshold = 0.9) {
   if (!sigma || sigma <= 0) return null;
   let best = null, fb = null; // fb = mốc gần nhất tính được (dự phòng khi không mức nào đạt ngưỡng)
@@ -3598,12 +3628,18 @@ function _highProbTarget(bars, feats, nowFeat, dirUp, mu, sigma, last, H, thresh
   }
   const pick = best || fb; // luôn có mốc nếu tính được ít nhất 1 khoảng cách (B luôn chạy khi có ATR)
   if (!pick) return null;
+  const tAll = _touchTimeAll(bars, dirUp, pick.d, H, 0.9); // Time90 toàn lịch sử (có điều kiện đã chạm)
+  const tAna = _touchTimeAnalog(bars, feats, nowFeat, dirUp, pick.d, H, 0.9); // Time90 trên nhóm analog
   return {
     level: dirUp ? last + pick.d : last - pick.d,
     distPct: (pick.d / last) * 100,
     mult: +pick.m.toFixed(2),
     prob: Math.round(pick.p * 100),
-    bars: _medianTouchBars(bars, dirUp, pick.d, H),
+    bars: _medianTouchBars(bars, dirUp, pick.d, H), // trung vị (phân vị 50) thời-gian-chạm
+    time90All: tAll ? tAll.t : null,
+    nAll: tAll ? tAll.n : 0,
+    time90Ana: tAna ? tAna.t : null,
+    nAna: tAna ? tAna.n : 0,
     below90: !best, // true nếu ngay cả mốc gần nhất cũng < 90% (rất hiếm; prob hiển thị nói thật)
   };
 }
@@ -4782,7 +4818,7 @@ function StrategyModal({ row, onClose, onOpenCMT }) {
     const rr = rk > 0 ? rw / rk : 0;
     // T90 vốn gần → KHÔNG chặn theo RR; chỉ cần đúng hướng.
     const ok = long ? tp > entry : tp < entry;
-    return { long, entry, sl, tp, rr, ok, useT90, t90prob: row.t90 ? row.t90.prob : null, t90bars: row.t90 ? row.t90.bars : null };
+    return { long, entry, sl, tp, rr, ok, useT90, t90prob: row.t90 ? row.t90.prob : null, t90time: row.t90 ? (row.t90.time90Ana ?? row.t90.time90All) : null };
   })();
   const scenBar = (label, val, color) => (
     <div style={{ marginBottom: 6 }}>
@@ -4904,7 +4940,7 @@ function StrategyModal({ row, onClose, onOpenCMT }) {
                   <div className="kv" style={{ border: "none", padding: "2px 0" }}>
                     <span>
                       {sug.useT90
-                        ? `Chốt lời — T90 (~${sug.t90prob}% chạm, ≈${sug.t90bars == null ? "?" : sug.t90bars} phiên)`
+                        ? `Chốt lời — T90 (~${sug.t90prob}% chạm, 90% trong ≤${sug.t90time == null ? "?" : sug.t90time} phiên)`
                         : "Chốt lời (TP1)"}
                     </span>
                     <span className="num" style={{ color: CLR.bull }}>{fx(sug.tp)}</span>
@@ -4960,7 +4996,7 @@ function StrategyModal({ row, onClose, onOpenCMT }) {
               }}
             >
               <div className="sub" style={{ margin: "0 0 4px" }}>
-                T90 — mục tiêu ~90% giá sẽ CHẠM tới (≈{row.t90.bars == null ? "?" : row.t90.bars} phiên)
+                T90 — mục tiêu ~90% giá sẽ CHẠM tới
               </div>
               <div className="num" style={{ fontSize: 19, fontWeight: 800, color: CLR.bull }}>
                 {fx(row.t90.level)}{" "}
@@ -4968,8 +5004,19 @@ function StrategyModal({ row, onClose, onOpenCMT }) {
                   ({row.t90.distPct.toFixed(2)}% · {row.t90.mult}·ATR · P={row.t90.prob}%)
                 </span>
               </div>
+              <div style={{ fontSize: 11.5, color: CLR.dim, marginTop: 7, display: "flex", gap: 14, flexWrap: "wrap" }}>
+                <span>
+                  Time90 (analog, n={row.t90.nAna || "—"}):{" "}
+                  <b style={{ color: CLR.text }}>{row.t90.time90Ana == null ? "—" : "≤" + row.t90.time90Ana + " phiên"}</b>
+                </span>
+                <span>
+                  Time90 (toàn LS, n={row.t90.nAll || "—"}):{" "}
+                  <b style={{ color: CLR.text }}>{row.t90.time90All == null ? "—" : "≤" + row.t90.time90All + " phiên"}</b>
+                </span>
+                <span style={{ color: CLR.mut }}>trung vị {row.t90.bars == null ? "—" : row.t90.bars + " phiên"}</span>
+              </div>
               <div style={{ fontSize: 11.5, color: CLR.mut, marginTop: 5 }}>
-                Mức gần-chắc-ăn để chốt (một phần) trước khi giá có thể quay đầu — thường tới trước T1/pivot.
+                Time90 = 90% số lần ĐÃ chạm T90 xong trong ngần ấy phiên (bỏ các lần không chạm). Analog = chỉ tính trên phiên giống hiện tại (ít mẫu, nhất là khung Tuần); toàn LS = nhiều mẫu nhưng loãng điều kiện.
               </div>
             </div>
           )}
@@ -5554,7 +5601,7 @@ function ScreenerSection({ rows, openPair, scope = "fast" }) {
                     {r.t90 ? (
                       <span style={{ whiteSpace: "nowrap" }}>
                         <span style={{ fontWeight: 700, color: CLR.bull }}>{r.t90.level.toFixed(r.digits)}</span>
-                        <span style={{ color: CLR.dim }}> · {r.t90.distPct.toFixed(2)}% · ~{r.t90.bars == null ? "?" : r.t90.bars}p</span>
+                        <span style={{ color: CLR.dim }}> · {r.t90.distPct.toFixed(2)}% · 90%≤{r.t90.time90All == null ? "?" : r.t90.time90All}p</span>
                       </span>
                     ) : (
                       "—"
