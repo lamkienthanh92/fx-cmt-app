@@ -3910,6 +3910,7 @@ function screenPairStrategic(cfg, pd, opts) {
   const rule = scanBreakoutRule(closes);
   const atr = atrOHLC(barsW, opts.atrPeriod);
   const volPct = ((atr[n - 1] ?? 0) / last) * 100;
+  const _tp = touchProbabilities(barsW, closes, rsiArr, mac, atr, R, S, last, bias, opts.probHW || opts.probH || 20);
   const qb = quickPullbackBacktest(
     closes,
     bias === "down" ? "short" : "long",
@@ -3959,7 +3960,11 @@ function screenPairStrategic(cfg, pd, opts) {
   // cậy) càng phản ánh dư địa lãi/rủi ro thật, không chỉ điểm cao suông.
   const fibPick =
     bias === "down" ? fibTargets?.down : bias === "up" ? fibTargets?.up : null;
-  const fibScore = fibPick ? Math.min(100, fibPick.mult * 50) : 0;
+  const fibScore = fibPick
+    ? Math.min(100, fibPick.mult * 50)
+    : _tp.t90
+    ? Math.min(100, _tp.t90.mult * 50)
+    : 0;
   const score = Math.round(
     0.2 * evi +
       0.2 * (prob ?? 50) +
@@ -3985,6 +3990,10 @@ function screenPairStrategic(cfg, pd, opts) {
     pip: cfg.pip,
     price: last,
     tfScale: "W",
+    pTP: _tp.pTP,
+    pR: _tp.pR,
+    pS: _tp.pS,
+    t90: _tp.t90,
     tM,
     tW,
     consensus,
