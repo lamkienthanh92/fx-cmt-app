@@ -1674,7 +1674,14 @@ function buildStep8LayeredModel(
       entryT: bars1h[t.entryIdx] ? bars1h[t.entryIdx].t : null,
       exitT: bars1h[t.exitIdx] ? bars1h[t.exitIdx].t : null,
       entryPrice: t.entry,
-      exitPrice: bars1h[t.exitIdx] ? bars1h[t.exitIdx].c : t.entry,
+      exitPrice:
+        t.outcome === "tp"
+          ? t.tp
+          : t.outcome === "sl"
+            ? t.sl
+            : bars1h[t.exitIdx]
+              ? bars1h[t.exitIdx].c
+              : t.entry,
       r: t.r,
       outcome: t.outcome,
       isAddon: t.isAddon,
