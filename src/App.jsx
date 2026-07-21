@@ -2155,7 +2155,16 @@ function runLabForTF(bars, H, maxHold) {
     for (const f of formulas) {
       const m = backtestLabFormula(bars, closes, atr, idx, pickAt, dirUp, f.on, maxHold);
       if (!m.n || m.n < 8) continue; // mẫu quá ít — bỏ, không đủ tin cậy để xếp hạng
-      results.push({ key: `${f.key}_${dirUp ? "up" : "down"}`, label: f.label, dirUp, m });
+      // "Đang bật NGAY BÂY GIỜ?" = đúng nến 1H/4H VỪA ĐÓNG có khớp điều kiện
+      // công thức hay không (vào lệnh sẽ ở giá MỞ nến kế — chưa đóng, đúng quy
+      // ước "tín hiệu mới" đã dùng ở chỗ khác trong app, không nhìn tương lai).
+      results.push({
+        key: `${f.key}_${dirUp ? "up" : "down"}`,
+        label: f.label,
+        dirUp,
+        m,
+        nowSignal: !!f.on[bars.length - 1],
+      });
     }
   }
   results.sort((a, b) => b.m.win - a.m.win || b.m.pf - a.m.pf);
@@ -10214,6 +10223,33 @@ function IntradayTab({ cfg, digits, state }) {
                 <div className="sub" style={{ fontWeight: 700, color: CLR.text, marginBottom: 6 }}>
                   Khung {tfKey === "h4" ? "4H" : "1H"} — top {lab[tfKey].length} công thức
                 </div>
+                {(() => {
+                  const firing = lab[tfKey].filter((r) => r.nowSignal);
+                  return firing.length ? (
+                    <div
+                      style={{
+                        marginBottom: 8,
+                        padding: "8px 12px",
+                        borderRadius: 10,
+                        border: `1px solid ${CLR.bull}`,
+                        background: "rgba(63,214,164,.08)",
+                        fontSize: 12.5,
+                      }}
+                    >
+                      <b style={{ color: CLR.bull }}>⚡ Đang khớp NGAY BÂY GIỜ:</b>{" "}
+                      {firing
+                        .map(
+                          (r) =>
+                            `${r.label} (${r.dirUp ? "Long" : "Short"}, Win% ${r.m.win})`
+                        )
+                        .join(" · ")}
+                    </div>
+                  ) : (
+                    <div className="sub" style={{ marginBottom: 8, color: CLR.dim }}>
+                      Hiện KHÔNG có công thức nào trong top 5 khớp điều kiện ở nến vừa đóng — chưa có gì để vào ngay.
+                    </div>
+                  );
+                })()}
                 <div style={{ overflowX: "auto" }}>
                   <table className="tbl">
                     <thead>
@@ -10230,6 +10266,7 @@ function IntradayTab({ cfg, digits, state }) {
                         <th>Tổng R</th>
                         <th>MaxDD (R)</th>
                         <th>Giữ TB (nến)</th>
+                        <th>Đang bật ngay?</th>
                       </tr>
                     </thead>
                     <tbody>
@@ -10253,6 +10290,12 @@ function IntradayTab({ cfg, digits, state }) {
                           <td className="num" style={{ color: r.m.totR >= 0 ? CLR.bull : CLR.bear }}>{r.m.totR}R</td>
                           <td className="num" style={{ color: CLR.amber }}>{r.m.maxDD}R</td>
                           <td className="num">{r.m.avgHold}</td>
+                          <td
+                            className="num"
+                            style={{ fontWeight: 800, color: r.nowSignal ? (r.dirUp ? CLR.bull : CLR.bear) : CLR.dim }}
+                          >
+                            {r.nowSignal ? "CÓ ✓" : "Không"}
+                          </td>
                         </tr>
                       ))}
                     </tbody>
