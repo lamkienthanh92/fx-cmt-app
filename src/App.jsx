@@ -1722,6 +1722,262 @@ function runT90Backtest(entry) {
   };
 }
 
+// ============================================================
+// INDICATOR90 — dò + hiệu chỉnh 1 indicator (kèm tham số) sao cho MỖI LẦN nó
+// BẬT (đúng hướng dirUp — cùng hướng đang dùng cho T90 của khung đó), lịch sử
+// cho thấy ≥90% khả năng giá CHẠM được mức T90 (tính causal ngay lúc bật)
+// TRƯỚC KHI indicator TỰ TẮT (điều kiện quay về false). Dò riêng cho từng
+// khung Ngày/4H/1H, hiệu chỉnh riêng cho từng cặp — không gộp chung.
+//
+// TỐI ƯU HIỆU NĂNG (quan trọng, tránh treo trình duyệt):
+// Thay vì tính lại mức T90 (quét 24 hệ số nhân ATR) TỪ ĐẦU tại từng lần
+// indicator bật — vốn tốn O(n) mỗi lần, tổng cộng có thể lên tới hàng chục
+// tỷ phép tính trên khung 1H — ta DỰNG SẴN 1 LẦN (mỗi cặp+khung+hướng) một
+// "chỉ mục": với mỗi hệ số nhân m, mảng bool touched[m][i] = giá có chạm mức
+// close[i]±m·ATR[i] trong H nến tới hay không (quét 1 lượt duy nhất, O(n·H)),
+// rồi cộng dồn (prefix sum) để tra cứu tỉ lệ chạm lịch sử tại BẤT KỲ điểm j
+// nào trong O(1). Nhờ đó, tính "mức T90 causal tại lần bật thứ k" chỉ còn tốn
+// O(số hệ số nhân) thay vì O(n) — an toàn dù bật hàng trăm lần trên 1H.
+// ============================================================
+
+// Dựng chỉ mục chạm-mức theo mọi hệ số nhân ATR (0.25 → 6.00, bước 0.25) — dùng
+// chung cho toàn bộ ứng viên indicator của MỘT (cặp, khung, hướng).
+function _t90BuildIndex(bars, atr, dirUp, H) {
+  const n = bars.length;
+  const mults = [];
+  for (let mi = 25; mi <= 600; mi += 25) mults.push(mi / 100);
+  const M = mults.length;
+  const touched = Array.from({ length: M }, () => new Array(n).fill(false));
+  for (let i = 50; i < n - 1; i++) {
+    const sig = atr[i];
+    if (!sig) continue;
+    const c0 = bars[i].c;
+    const last = Math.min(n - 1, i + H);
+    const done = new Array(M).fill(false);
+    let remaining = M;
+    for (let k = i + 1; k <= last && remaining > 0; k++) {
+      const hh = bars[k].h, ll = bars[k].l;
+      for (let mi2 = 0; mi2 < M; mi2++) {
+        if (done[mi2]) continue;
+        const lvl = dirUp ? c0 + mults[mi2] * sig : c0 - mults[mi2] * sig;
+        if (dirUp ? hh >= lvl : ll <= lvl) {
+          done[mi2] = true;
+          touched[mi2][i] = true;
+          remaining--;
+        }
+      }
+    }
+  }
+  const prefix = touched.map((arr) => {
+    const p = new Array(n + 1).fill(0);
+    for (let i = 0; i < n; i++) p[i + 1] = p[i] + (arr[i] ? 1 : 0);
+    return p;
+  });
+  return { mults, touched, prefix, n };
+}
+// Chọn hệ số nhân causal tại điểm j (giống logic T90 gốc: giữ mức LỚN NHẤT mà
+// xác suất chạm lịch sử (tính TRÊN dữ liệu TRƯỚC j, không nhìn tương lai) vẫn ≥ thr).
+function _t90PickAt(idx, j, thr = 0.9) {
+  const denom = j - 51; // số điểm lịch sử i chạy 50..j-2
+  if (denom < 15) return null;
+  const { mults, prefix } = idx;
+  let bestMi = null, fbMi = null;
+  for (let mi = 0; mi < mults.length; mi++) {
+    const p = prefix[mi][j - 1] / denom;
+    if (fbMi == null) fbMi = mi;
+    if (p >= thr) bestMi = mi;
+    else if (bestMi != null) break;
+  }
+  return bestMi != null ? bestMi : fbMi;
+}
+// Chuỗi bool "on/off" của từng indicator ứng viên — đã quy theo ĐÚNG hướng dirUp.
+function _ind_rsiLevel(closes, dirUp, p, L) {
+  const r = rsi(closes, p);
+  const lvl = dirUp ? L : 100 - L;
+  return closes.map((_, i) => (r[i] == null ? false : dirUp ? r[i] >= lvl : r[i] <= lvl));
+}
+function _ind_macdState(closes, dirUp, fast, slow, sig) {
+  const m = macdCalc(closes, fast, slow, sig);
+  return closes.map((_, i) => {
+    const mm = m.macd[i], ss = m.signal[i];
+    if (mm == null || ss == null) return false;
+    return dirUp ? mm - ss > 0 : mm - ss < 0;
+  });
+}
+function _ind_maTrend(closes, dirUp, p) {
+  const s = sma(closes, p);
+  return closes.map((c, i) => (s[i] == null ? false : dirUp ? c > s[i] : c < s[i]));
+}
+function _ind_maSlope(closes, dirUp, p, k) {
+  const s = sma(closes, p);
+  return closes.map((_, i) => {
+    if (i < k || s[i] == null || s[i - k] == null) return false;
+    const slope = s[i] - s[i - k];
+    return dirUp ? slope > 0 : slope < 0;
+  });
+}
+function _ind_breakoutN(bars, dirUp, N) {
+  const n = bars.length;
+  const on = new Array(n).fill(false);
+  let active = false, level = null;
+  for (let i = N; i < n; i++) {
+    let hh = -Infinity, ll = Infinity;
+    for (let k = i - N; k < i; k++) {
+      if (bars[k].h > hh) hh = bars[k].h;
+      if (bars[k].l < ll) ll = bars[k].l;
+    }
+    if (!active) {
+      if (dirUp && bars[i].c > hh) { active = true; level = hh; }
+      else if (!dirUp && bars[i].c < ll) { active = true; level = ll; }
+    } else {
+      if (dirUp && bars[i].c < level) active = false;
+      else if (!dirUp && bars[i].c > level) active = false;
+    }
+    on[i] = active;
+  }
+  return on;
+}
+// Danh sách ứng viên dò/hiệu chỉnh — mỗi ứng viên là 1 TRẠNG THÁI (không phải
+// một cú "cắt" tức thời): "còn tín hiệu" nghĩa là trạng thái này vẫn đang true,
+// "tự tắt" là lúc nó quay về false.
+function indicator90Candidates(bars, closes, dirUp) {
+  const list = [];
+  [55, 60, 65, 70].forEach((L) => {
+    list.push({
+      key: `RSI14_${L}`,
+      label: `RSI(14) ${dirUp ? "≥" : "≤"} ${dirUp ? L : 100 - L}`,
+      on: _ind_rsiLevel(closes, dirUp, 14, L),
+    });
+  });
+  [[12, 26, 9], [5, 13, 6]].forEach(([f, s, g]) => {
+    list.push({
+      key: `MACD_${f}_${s}_${g}`,
+      label: `MACD(${f},${s},${g}) ${dirUp ? "hist>0" : "hist<0"}`,
+      on: _ind_macdState(closes, dirUp, f, s, g),
+    });
+  });
+  [20, 50, 100].forEach((p) => {
+    list.push({
+      key: `MA_${p}`,
+      label: `Giá ${dirUp ? ">" : "<"} SMA${p}`,
+      on: _ind_maTrend(closes, dirUp, p),
+    });
+  });
+  [20, 50].forEach((p) => {
+    list.push({
+      key: `SLOPE_${p}`,
+      label: `SMA${p} dốc ${dirUp ? "lên" : "xuống"}`,
+      on: _ind_maSlope(closes, dirUp, p, 5),
+    });
+  });
+  [10, 20, 40].forEach((N) => {
+    list.push({
+      key: `BRK_${N}`,
+      label: `Breakout ${N} nến (đóng cửa ${dirUp ? "trên đỉnh" : "dưới đáy"})`,
+      on: _ind_breakoutN(bars, dirUp, N),
+    });
+  });
+  return list;
+}
+// Dò + hiệu chỉnh cho MỘT (cặp đang mở, khung, hướng) — trả về ứng viên tốt
+// nhất (ưu tiên ≥90%, tie-break bằng specificity rồi tới cỡ mẫu n) cùng toàn
+// bộ bảng so sánh (để debug/hiển thị thêm nếu cần).
+function calibrateIndicator90(bars, dirUp, H) {
+  if (!bars || bars.length < 150) return null;
+  const closes = bars.map((b) => b.c);
+  const atr = atrOHLC(bars, 14);
+  const idx = _t90BuildIndex(bars, atr, dirUp, H);
+  const n = bars.length;
+  // Pick + ground-truth (chạm T90 trong đúng cửa sổ H chuẩn) tại MỌI nến — tính
+  // 1 LẦN, dùng chung cho toàn bộ ứng viên bên dưới (không lặp lại theo indicator).
+  const pickAt = new Array(n).fill(null);
+  const actualAt = new Array(n).fill(null); // null = chưa đủ mẫu lịch sử để tính T90
+  for (let i = 66; i < n - 1; i++) {
+    const mi = _t90PickAt(idx, i, 0.9);
+    if (mi == null) continue;
+    pickAt[i] = mi;
+    actualAt[i] = idx.touched[mi][i];
+  }
+  const cands = indicator90Candidates(bars, closes, dirUp);
+  const scored = [];
+  for (const c of cands) {
+    const evsAll = _onEvents(c.on).filter((e) => e.start >= 66);
+    if (evsAll.length < 8) continue; // mẫu quá ít — bỏ ứng viên này
+    const evs = evsAll.slice(-150); // chỉ lấy các lần gần nhất — chặn chi phí tính khi bật/tắt quá nhiều lần
+    let hit = 0, valid = 0;
+    for (const e of evs) {
+      const mi = pickAt[e.start];
+      if (mi == null) continue;
+      valid++;
+      const d = idx.mults[mi] * atr[e.start];
+      const lvl = dirUp ? closes[e.start] + d : closes[e.start] - d;
+      for (let k = e.start + 1; k <= e.end; k++) {
+        if (dirUp ? bars[k].h >= lvl : bars[k].l <= lvl) { hit++; break; }
+      }
+    }
+    if (valid < 8) continue;
+    // Độ nhạy/đặc hiệu: so trạng thái ON/OFF của indicator với ground-truth
+    // "lẽ ra giá có chạm T90 trong cửa sổ H chuẩn hay không" tại MỌI nến.
+    let tp = 0, fp = 0, fn = 0, tn = 0;
+    for (let i = 66; i < n - 1; i++) {
+      if (actualAt[i] == null) continue;
+      const pred = c.on[i], actual = actualAt[i];
+      if (pred && actual) tp++;
+      else if (pred && !actual) fp++;
+      else if (!pred && actual) fn++;
+      else tn++;
+    }
+    const hitRate = Math.round((hit / valid) * 100);
+    scored.push({
+      key: c.key,
+      label: c.label,
+      n: valid,
+      totalEvents: evsAll.length,
+      hitRate,
+      sens: tp + fn > 0 ? Math.round((tp / (tp + fn)) * 100) : null,
+      spec: tn + fp > 0 ? Math.round((tn / (tn + fp)) * 100) : null,
+      falseRate: 100 - hitRate,
+      on: !!c.on[n - 1],
+    });
+  }
+  if (!scored.length) return null;
+  const pass = scored.filter((s) => s.hitRate >= 90);
+  const pick = pass.length
+    ? pass.sort((a, b) => (b.spec ?? -1) - (a.spec ?? -1) || b.n - a.n)[0]
+    : scored.slice().sort((a, b) => b.hitRate - a.hitRate)[0];
+  return { best: pick, reached90: pass.length > 0, all: scored };
+}
+function _onEvents(on) {
+  const evs = [];
+  let i = 0;
+  while (i < on.length) {
+    if (on[i] && (i === 0 || !on[i - 1])) {
+      let j = i;
+      while (j + 1 < on.length && on[j + 1]) j++;
+      evs.push({ start: i, end: j });
+      i = j + 1;
+    } else i++;
+  }
+  return evs;
+}
+// Chạy cho cả 3 khung Ngày/4H/1H của MỘT cặp đang mở — mỗi khung tự dò + tự
+// lấy hướng từ đúng cổng CMT (gate) của khung đó (model.gates.D/H4/H1.dir),
+// để so sánh xem indicator tối ưu có khác nhau giữa các khung hay không.
+function runIndicator90(entry, gates) {
+  if (!entry || entry.status !== "ok" || !gates) return null;
+  const cfgs = [
+    { key: "D", label: "Ngày", bars: entry.d1, gate: gates.D, H: 20 },
+    { key: "H4", label: "4H", bars: entry.h4, gate: gates.H4, H: 60 },
+    { key: "H1", label: "1H", bars: entry.h1, gate: gates.H1, H: 120 },
+  ];
+  return cfgs.map((c) => ({
+    key: c.key,
+    label: c.label,
+    dir: c.gate ? c.gate.dir : null,
+    result: c.gate && c.gate.dir ? calibrateIndicator90(c.bars, c.gate.dir === "long", c.H) : null,
+  }));
+}
+
 function buildStep8LayeredModel(
   dailyBars,
   weeklyBars,
@@ -9690,6 +9946,75 @@ function IntradayTab({ cfg, digits, state }) {
           </p>
         </Panel>
       )}
+      {indicator90 && (
+        <Panel
+          mod="Indicator90"
+          title="Indicator90 — chỉ báo xác nhận T90, dò riêng theo từng khung"
+          sub="Với mỗi khung Ngày/4H/1H: dò + hiệu chỉnh 1 indicator (kèm tham số) sao cho MỖI LẦN nó bật (đúng hướng CMT của khung đó), lịch sử cho thấy giá chạm được T90 (tính causal ngay lúc bật) TRƯỚC KHI indicator tự tắt, với xác suất ≥90%. Độ nhạy/đặc hiệu so với ground-truth 'lẽ ra có chạm T90 trong cửa sổ chuẩn hay không' tại mọi nến."
+        >
+          <div style={{ overflowX: "auto" }}>
+            <table className="tbl">
+              <thead>
+                <tr>
+                  <th>Khung</th>
+                  <th>Hướng (CMT)</th>
+                  <th>Indicator tối ưu</th>
+                  <th>Chạm T90 khi bật (n)</th>
+                  <th>Độ nhạy</th>
+                  <th>Độ đặc hiệu</th>
+                  <th>Tín hiệu giả</th>
+                  <th>Đang bật?</th>
+                </tr>
+              </thead>
+              <tbody>
+                {indicator90.map((row) => (
+                  <tr key={row.key}>
+                    <td style={{ fontWeight: 700 }}>{row.label}</td>
+                    <td>
+                      {row.dir ? (
+                        <span style={{ color: row.dir === "long" ? CLR.bull : CLR.bear, fontWeight: 700 }}>
+                          {row.dir === "long" ? "Long" : "Short"}
+                        </span>
+                      ) : (
+                        <span style={{ color: CLR.dim }}>Side — chưa rõ hướng</span>
+                      )}
+                    </td>
+                    {row.result ? (
+                      <>
+                        <td>{row.result.best.label}</td>
+                        <td className="num" style={{ color: row.result.reached90 ? CLR.bull : CLR.amber, fontWeight: 700 }}>
+                          {row.result.best.hitRate}% (n={row.result.best.n})
+                        </td>
+                        <td className="num">{row.result.best.sens != null ? `${row.result.best.sens}%` : "—"}</td>
+                        <td className="num">{row.result.best.spec != null ? `${row.result.best.spec}%` : "—"}</td>
+                        <td className="num">{row.result.best.falseRate != null ? `${row.result.best.falseRate}%` : "—"}</td>
+                        <td
+                          className="num"
+                          style={{ fontWeight: 700, color: row.result.best.on ? CLR.bull : CLR.dim }}
+                        >
+                          {row.result.best.on ? "CÓ" : "Không"}
+                        </td>
+                      </>
+                    ) : (
+                      <td colSpan={5} className="num" style={{ color: CLR.dim }}>
+                        {row.dir ? "không đủ dữ liệu / mẫu quá ít" : "—"}
+                      </td>
+                    )}
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+          {indicator90.some((r) => r.result && !r.result.reached90) && (
+            <p className="sub" style={{ marginTop: 8, color: CLR.amber }}>
+              Khung nào chưa đạt ngưỡng ≥90% sẽ hiện ứng viên GẦN NHẤT tìm được (tỉ lệ chạm T90 cao nhất trong số đã dò) — không phải bộ đã đạt chuẩn.
+            </p>
+          )}
+          <p className="sub" style={{ marginTop: 8 }}>
+            "Đang bật?" = tại nến gần nhất, indicator được chọn có đang ở trạng thái ON hay không — tức có đang trong "cửa sổ tín hiệu" hay đã tắt. Mỗi khung tự dò riêng nên indicator tối ưu có thể khác nhau giữa Ngày/4H/1H.
+          </p>
+        </Panel>
+      )}
       <Panel
         mod="CMT Pullback"
         title="CMT Pullback — daily có xu hướng thì vào theo pullback 4H · SL = swing gần nhất · TP = pivot Ngày"
@@ -10308,6 +10633,11 @@ export default function App() {
     }
     return m;
   }, [series, ohlcStore, cfg, fullPairData, vix, cotForPair]);
+
+  const indicator90 = useMemo(
+    () => runIndicator90(intradayEntry, model ? model.gates : null),
+    [intradayEntry, model]
+  );
 
   const hist = useMemo(() => {
     if (!cfg) return null;
