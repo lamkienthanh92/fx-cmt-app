@@ -1960,23 +1960,35 @@ function _onEvents(on) {
   }
   return evs;
 }
-// Chạy cho cả 3 khung Ngày/4H/1H của MỘT cặp đang mở — mỗi khung tự dò + tự
-// lấy hướng từ đúng cổng CMT (gate) của khung đó (model.gates.D/H4/H1.dir),
-// để so sánh xem indicator tối ưu có khác nhau giữa các khung hay không.
-function runIndicator90(entry, gates) {
-  if (!entry || entry.status !== "ok" || !gates) return null;
+// Chạy cho cả 3 khung Ngày/4H/1H của MỘT cặp đang mở. QUAN TRỌNG: T90 luôn tồn
+// tại cho CẢ 2 hướng (trên/dưới) bất kể giá đang trend hay đi ngang — nên
+// KHÔNG được bắt điều kiện "phải có gate/breakout xác nhận hướng" mới chạy
+// (bản trước làm vậy nên bảng trống hầu hết thời gian, kể cả khi đi ngang).
+// Mỗi khung luôn dò riêng cho cả hướng lên VÀ hướng xuống, không phụ thuộc
+// xu hướng Dow hay cổng breakout hiện tại — đúng như "dù đi ngang hay có xu
+// hướng thì vẫn theo T90".
+function runIndicator90(entry) {
+  if (!entry || entry.status !== "ok") return null;
   const cfgs = [
-    { key: "D", label: "Ngày", bars: entry.d1, gate: gates.D, H: 20 },
-    { key: "H4", label: "4H", bars: entry.h4, gate: gates.H4, H: 60 },
-    { key: "H1", label: "1H", bars: entry.h1, gate: gates.H1, H: 120 },
+    { key: "D", label: "Ngày", bars: entry.d1, H: 20 },
+    { key: "H4", label: "4H", bars: entry.h4, H: 60 },
+    { key: "H1", label: "1H", bars: entry.h1, H: 120 },
   ];
-  return cfgs.map((c) => ({
-    key: c.key,
-    label: c.label,
-    dir: c.gate ? c.gate.dir : null,
-    result: c.gate && c.gate.dir ? calibrateIndicator90(c.bars, c.gate.dir === "long", c.H) : null,
-  }));
+  const out = [];
+  for (const c of cfgs) {
+    for (const dirUp of [true, false]) {
+      out.push({
+        key: `${c.key}_${dirUp ? "up" : "down"}`,
+        label: c.label,
+        dirUp,
+        dirLabel: dirUp ? "T90 trên" : "T90 dưới",
+        result: calibrateIndicator90(c.bars, dirUp, c.H),
+      });
+    }
+  }
+  return out;
 }
+
 
 function buildStep8LayeredModel(
   dailyBars,
@@ -9949,15 +9961,15 @@ function IntradayTab({ cfg, digits, state }) {
       {indicator90 && (
         <Panel
           mod="Indicator90"
-          title="Indicator90 — chỉ báo xác nhận T90, dò riêng theo từng khung"
-          sub="Với mỗi khung Ngày/4H/1H: dò + hiệu chỉnh 1 indicator (kèm tham số) sao cho MỖI LẦN nó bật (đúng hướng CMT của khung đó), lịch sử cho thấy giá chạm được T90 (tính causal ngay lúc bật) TRƯỚC KHI indicator tự tắt, với xác suất ≥90%. Độ nhạy/đặc hiệu so với ground-truth 'lẽ ra có chạm T90 trong cửa sổ chuẩn hay không' tại mọi nến."
+          title="Indicator90 — chỉ báo xác nhận T90, dò riêng theo từng khung × từng hướng"
+          sub="T90 luôn tồn tại cho CẢ 2 hướng (trên/dưới) bất kể giá đang trend hay đi ngang — nên mỗi khung Ngày/4H/1H đều dò riêng cho cả T90 trên và T90 dưới, không cần chờ breakout hay có xu hướng rõ ràng. Với mỗi hướng: dò + hiệu chỉnh 1 indicator (kèm tham số) sao cho MỖI LẦN nó bật, lịch sử cho thấy giá chạm được T90 hướng đó (tính causal ngay lúc bật) TRƯỚC KHI indicator tự tắt, với xác suất ≥90%. Độ nhạy/đặc hiệu so với ground-truth 'lẽ ra có chạm T90 trong cửa sổ chuẩn hay không' tại mọi nến."
         >
           <div style={{ overflowX: "auto" }}>
             <table className="tbl">
               <thead>
                 <tr>
                   <th>Khung</th>
-                  <th>Hướng (CMT)</th>
+                  <th>Hướng T90</th>
                   <th>Indicator tối ưu</th>
                   <th>Chạm T90 khi bật (n)</th>
                   <th>Độ nhạy</th>
@@ -9971,13 +9983,9 @@ function IntradayTab({ cfg, digits, state }) {
                   <tr key={row.key}>
                     <td style={{ fontWeight: 700 }}>{row.label}</td>
                     <td>
-                      {row.dir ? (
-                        <span style={{ color: row.dir === "long" ? CLR.bull : CLR.bear, fontWeight: 700 }}>
-                          {row.dir === "long" ? "Long" : "Short"}
-                        </span>
-                      ) : (
-                        <span style={{ color: CLR.dim }}>Side — chưa rõ hướng</span>
-                      )}
+                      <span style={{ color: row.dirUp ? CLR.bull : CLR.bear, fontWeight: 700 }}>
+                        {row.dirLabel}
+                      </span>
                     </td>
                     {row.result ? (
                       <>
@@ -9997,7 +10005,7 @@ function IntradayTab({ cfg, digits, state }) {
                       </>
                     ) : (
                       <td colSpan={5} className="num" style={{ color: CLR.dim }}>
-                        {row.dir ? "không đủ dữ liệu / mẫu quá ít" : "—"}
+                        không đủ dữ liệu / mẫu quá ít
                       </td>
                     )}
                   </tr>
@@ -10007,7 +10015,7 @@ function IntradayTab({ cfg, digits, state }) {
           </div>
           {indicator90.some((r) => r.result && !r.result.reached90) && (
             <p className="sub" style={{ marginTop: 8, color: CLR.amber }}>
-              Khung nào chưa đạt ngưỡng ≥90% sẽ hiện ứng viên GẦN NHẤT tìm được (tỉ lệ chạm T90 cao nhất trong số đã dò) — không phải bộ đã đạt chuẩn.
+              Khung/hướng nào chưa đạt ngưỡng ≥90% sẽ hiện ứng viên GẦN NHẤT tìm được (tỉ lệ chạm T90 cao nhất trong số đã dò) — không phải bộ đã đạt chuẩn.
             </p>
           )}
           <p className="sub" style={{ marginTop: 8 }}>
@@ -10635,8 +10643,8 @@ export default function App() {
   }, [series, ohlcStore, cfg, fullPairData, vix, cotForPair]);
 
   const indicator90 = useMemo(
-    () => runIndicator90(intradayEntry, model ? model.gates : null),
-    [intradayEntry, model]
+    () => runIndicator90(intradayEntry),
+    [intradayEntry]
   );
 
   const hist = useMemo(() => {
