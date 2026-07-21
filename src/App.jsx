@@ -9766,7 +9766,7 @@ function buildCMTModel(barsByTF, dxySeries, vixSeries, cot, seas, cfg) {
    ============================================================ */
 
 function IntradayTab({ cfg, digits, state }) {
-  const { status, error, model, step8Model, t90Bt, symbol, opts, setOpts } = state;
+  const { status, error, model, step8Model, t90Bt, indicator90, symbol, opts, setOpts } = state;
   const fx = (v) => (v == null ? "—" : Number(v).toFixed(digits));
   if (status === "err")
     return (
@@ -11135,6 +11135,7 @@ export default function App() {
               model: intradayModel,
               step8Model,
               t90Bt,
+              indicator90,
               symbol: intradaySymbol,
               opts: intradayOpts,
               setOpts: setIntradayOpts,
