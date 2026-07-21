@@ -1989,6 +1989,185 @@ function runIndicator90(entry) {
   return out;
 }
 
+// ============================================================
+// LAB — "phòng thí nghiệm" công thức vào lệnh: chưa biết công thức nào ăn,
+// nên chạy NHIỀU công thức vào lệnh khác nhau (không phải 1 indicator đơn lẻ
+// như Indicator90 ở trên) trên khung 4H và 1H, backtest thật (vào/thoát từng
+// nến), mục tiêu = CHẠM T90 (đúng khung, đúng hướng). SL không phải trọng tâm
+// tối ưu ở đây nhưng vẫn phải HỢP LÝ (lấy theo cấu trúc — swing gần nhất —
+// chứ không nới rộng tuỳ tiện, vì SL quá rộng thì đảo chiều là mất sạch, R:R
+// vỡ). Trả về TOP 5 công thức tốt nhất mỗi khung (win% chạm T90, tie-break PF).
+//
+// Tái dùng lại đúng chỉ mục T90 (_t90BuildIndex/_t90PickAt) và SL cấu trúc
+// (_nearestSwingTF) đã có ở phần Backtest T90 phía trên — không phát minh lại,
+// chỉ đổi phần "công thức vào lệnh" cho đa dạng.
+// ============================================================
+
+// Mỗi hàm _lab_* trả mảng bool: TRIGGER (kích hoạt vào lệnh) tại đúng nến i —
+// khác Indicator90 (trạng thái duy trì on/off), đây là điểm bấm cò rời rạc.
+function _lab_pullbackEMA(closes, dirUp, trendOwn, emaP) {
+  const e = ema(closes, emaP);
+  const out = new Array(closes.length).fill(false);
+  for (let i = 1; i < closes.length; i++) {
+    if (trendOwn[i] !== (dirUp ? "up" : "down")) continue;
+    if (e[i] == null || e[i - 1] == null) continue;
+    const pulled = dirUp ? closes[i - 1] <= e[i - 1] : closes[i - 1] >= e[i - 1];
+    const resumed = dirUp ? closes[i] > e[i] : closes[i] < e[i];
+    out[i] = pulled && resumed;
+  }
+  return out;
+}
+function _lab_rsiBounce(closes, dirUp, trendOwn, p, lvl) {
+  const r = rsi(closes, p);
+  const out = new Array(closes.length).fill(false);
+  const L = dirUp ? lvl : 100 - lvl;
+  for (let i = 1; i < closes.length; i++) {
+    if (trendOwn && trendOwn[i] !== (dirUp ? "up" : "down")) continue;
+    if (r[i] == null || r[i - 1] == null) continue;
+    out[i] = dirUp ? r[i - 1] < L && r[i] >= L : r[i - 1] > L && r[i] <= L;
+  }
+  return out;
+}
+function _lab_macdFlip(closes, dirUp, trendOwn) {
+  const m = macd(closes);
+  const out = new Array(closes.length).fill(false);
+  for (let i = 1; i < closes.length; i++) {
+    if (trendOwn[i] !== (dirUp ? "up" : "down")) continue;
+    const h0 = m[i - 1].hist, h1 = m[i].hist;
+    if (h0 == null || h1 == null) continue;
+    out[i] = dirUp ? h0 <= 0 && h1 > 0 : h0 >= 0 && h1 < 0;
+  }
+  return out;
+}
+function _lab_breakoutN(bars, closes, dirUp, trendOwn, N) {
+  const out = new Array(closes.length).fill(false);
+  for (let i = N; i < closes.length; i++) {
+    if (trendOwn[i] !== (dirUp ? "up" : "down")) continue;
+    let hh = -Infinity, ll = Infinity;
+    for (let k = i - N; k < i; k++) {
+      if (bars[k].h > hh) hh = bars[k].h;
+      if (bars[k].l < ll) ll = bars[k].l;
+    }
+    out[i] = dirUp ? closes[i] > hh && closes[i - 1] <= hh : closes[i] < ll && closes[i - 1] >= ll;
+  }
+  return out;
+}
+function _lab_maCross(closes, dirUp, fast, slow) {
+  const f = sma(closes, fast), s = sma(closes, slow);
+  const out = new Array(closes.length).fill(false);
+  for (let i = 1; i < closes.length; i++) {
+    if (f[i] == null || s[i] == null || f[i - 1] == null || s[i - 1] == null) continue;
+    out[i] = dirUp ? f[i - 1] <= s[i - 1] && f[i] > s[i] : f[i - 1] >= s[i - 1] && f[i] < s[i];
+  }
+  return out;
+}
+function _lab_atrEnvelopeBreak(closes, atr, dirUp, emaP, mult) {
+  const e = ema(closes, emaP);
+  const out = new Array(closes.length).fill(false);
+  for (let i = 1; i < closes.length; i++) {
+    if (e[i] == null || e[i - 1] == null || !atr[i]) continue;
+    const sigPrev = atr[i - 1] || atr[i];
+    const lvl = dirUp ? e[i] + mult * atr[i] : e[i] - mult * atr[i];
+    const lvlPrev = dirUp ? e[i - 1] + mult * sigPrev : e[i - 1] - mult * sigPrev;
+    out[i] = dirUp ? closes[i - 1] <= lvlPrev && closes[i] > lvl : closes[i - 1] >= lvlPrev && closes[i] < lvl;
+  }
+  return out;
+}
+function _lab_confluence(closes, dirUp, trendOwn, rsiLvl, maP) {
+  const r = rsi(closes, 14), s = sma(closes, maP);
+  const out = new Array(closes.length).fill(false);
+  const L = dirUp ? rsiLvl : 100 - rsiLvl;
+  for (let i = 1; i < closes.length; i++) {
+    if (trendOwn[i] !== (dirUp ? "up" : "down")) continue;
+    if (r[i] == null || r[i - 1] == null || s[i] == null) continue;
+    const rsiCross = dirUp ? r[i - 1] < L && r[i] >= L : r[i - 1] > L && r[i] <= L;
+    const maSide = dirUp ? closes[i] > s[i] : closes[i] < s[i];
+    out[i] = rsiCross && maSide;
+  }
+  return out;
+}
+// Toàn bộ danh sách công thức ứng viên cho MỘT hướng — tự do phối hợp, không
+// cố định vào 1 kiểu; mục đích là dò xem kiểu nào ăn với ĐÚNG cặp/khung này.
+function labFormulaCandidates(bars, closes, atr, trendOwn, dirUp) {
+  return [
+    { key: "pullback_ema20", label: "Pullback EMA20 + trend", on: _lab_pullbackEMA(closes, dirUp, trendOwn, 20) },
+    { key: "rsi_bounce_35_trend", label: "RSI(14) bật 35/65 + trend", on: _lab_rsiBounce(closes, dirUp, trendOwn, 14, 35) },
+    { key: "rsi_bounce_30_notrend", label: "RSI(14) bật 30/70 (không lọc trend)", on: _lab_rsiBounce(closes, dirUp, null, 14, 30) },
+    { key: "macd_flip_trend", label: "MACD đảo dấu + trend", on: _lab_macdFlip(closes, dirUp, trendOwn) },
+    { key: "breakout20_trend", label: "Breakout 20 nến + trend", on: _lab_breakoutN(bars, closes, dirUp, trendOwn, 20) },
+    { key: "breakout10_trend", label: "Breakout 10 nến + trend", on: _lab_breakoutN(bars, closes, dirUp, trendOwn, 10) },
+    { key: "ma_cross_10_50", label: "SMA10 cắt SMA50", on: _lab_maCross(closes, dirUp, 10, 50) },
+    { key: "atr_env_break", label: "Phá bao ATR quanh EMA20 (1.5×)", on: _lab_atrEnvelopeBreak(closes, atr, dirUp, 20, 1.5) },
+    { key: "confluence_rsi_ma", label: "RSI bật + giá vs SMA50 + trend", on: _lab_confluence(closes, dirUp, trendOwn, 55, 50) },
+  ];
+}
+// Backtest THẬT cho 1 công thức: vào ngay sau nến trigger (giá mở nến kế) ·
+// TP = T90 causal (tra O(1) từ chỉ mục đã dựng sẵn) · SL = swing cấu trúc gần
+// nhất (HỢP LÝ, không nới rộng tuỳ tiện — dùng đúng hàm _nearestSwingTF đã
+// kiểm chứng ở Backtest T90) · thoát tại TP/SL/hết maxHold, tối đa 1 lệnh cùng
+// lúc. Trả về metrics dùng chung _t90Metrics.
+function backtestLabFormula(bars, closes, atr, idx, pickAt, dirUp, onTrigger, maxHold) {
+  const trades = [];
+  let freeAt = 0;
+  for (let i = 66; i < bars.length - 1; i++) {
+    if (!onTrigger[i] || i < freeAt) continue;
+    const mi = pickAt[i];
+    if (mi == null) continue;
+    const entryIdx = i + 1;
+    if (entryIdx >= bars.length) continue;
+    const entry = bars[entryIdx].o;
+    const sl = _nearestSwingTF(bars, entryIdx, dirUp, 40, 2);
+    if (sl == null || (dirUp ? sl >= entry : sl <= entry)) continue;
+    const risk = Math.abs(entry - sl);
+    if (!risk) continue;
+    const d = idx.mults[mi] * atr[i];
+    const tp = dirUp ? closes[i] + d : closes[i] - d;
+    if (dirUp ? tp <= entry : tp >= entry) continue;
+    const last = Math.min(bars.length - 1, entryIdx + maxHold - 1);
+    let outcome = "timeout", exitIdx = last, exit = bars[last].c;
+    for (let k = entryIdx; k <= last; k++) {
+      const b = bars[k];
+      if (dirUp ? b.l <= sl : b.h >= sl) { outcome = "sl"; exitIdx = k; exit = sl; break; }
+      if (dirUp ? b.h >= tp : b.l <= tp) { outcome = "tp"; exitIdx = k; exit = tp; break; }
+    }
+    const r = (dirUp ? exit - entry : entry - exit) / risk;
+    trades.push({ r, outcome, hold: exitIdx - entryIdx });
+    freeAt = exitIdx + 1;
+  }
+  return _t90Metrics(trades);
+}
+// Chạy toàn bộ ứng viên (9 công thức × 2 hướng) cho MỘT khung — chỉ mục T90
+// dựng 1 lần/hướng rồi dùng lại cho mọi công thức (không tính lại nhiều lần).
+function runLabForTF(bars, H, maxHold) {
+  if (!bars || bars.length < 150) return null;
+  const closes = bars.map((b) => b.c);
+  const atr = atrOHLC(bars, 14);
+  const trendOwn = buildTrendSeriesOHLC(bars, 3, 3);
+  const results = [];
+  for (const dirUp of [true, false]) {
+    const idx = _t90BuildIndex(bars, atr, dirUp, H);
+    const pickAt = new Array(bars.length).fill(null);
+    for (let i = 66; i < bars.length - 1; i++) {
+      const mi = _t90PickAt(idx, i, 0.9);
+      if (mi != null) pickAt[i] = mi;
+    }
+    const formulas = labFormulaCandidates(bars, closes, atr, trendOwn, dirUp);
+    for (const f of formulas) {
+      const m = backtestLabFormula(bars, closes, atr, idx, pickAt, dirUp, f.on, maxHold);
+      if (!m.n || m.n < 8) continue; // mẫu quá ít — bỏ, không đủ tin cậy để xếp hạng
+      results.push({ key: `${f.key}_${dirUp ? "up" : "down"}`, label: f.label, dirUp, m });
+    }
+  }
+  results.sort((a, b) => b.m.win - a.m.win || b.m.pf - a.m.pf);
+  return results.slice(0, 5); // top 5 công thức tốt nhất của khung này
+}
+function runLab(entry) {
+  if (!entry || entry.status !== "ok") return null;
+  return {
+    h4: runLabForTF(entry.h4, 60, 150),
+    h1: runLabForTF(entry.h1, 120, 250),
+  };
+}
 
 function buildStep8LayeredModel(
   dailyBars,
@@ -9778,7 +9957,7 @@ function buildCMTModel(barsByTF, dxySeries, vixSeries, cot, seas, cfg) {
    ============================================================ */
 
 function IntradayTab({ cfg, digits, state }) {
-  const { status, error, model, step8Model, t90Bt, indicator90, symbol, opts, setOpts } = state;
+  const { status, error, model, step8Model, t90Bt, indicator90, lab, symbol, opts, setOpts } = state;
   const fx = (v) => (v == null ? "—" : Number(v).toFixed(digits));
   if (status === "err")
     return (
@@ -10020,6 +10199,74 @@ function IntradayTab({ cfg, digits, state }) {
           )}
           <p className="sub" style={{ marginTop: 8 }}>
             "Đang bật?" = tại nến gần nhất, indicator được chọn có đang ở trạng thái ON hay không — tức có đang trong "cửa sổ tín hiệu" hay đã tắt. Mỗi khung tự dò riêng nên indicator tối ưu có thể khác nhau giữa Ngày/4H/1H.
+          </p>
+        </Panel>
+      )}
+      {lab && (lab.h4 || lab.h1) && (
+        <Panel
+          mod="Lab"
+          title="Lab — thử nhiều công thức vào lệnh, chọn ra công thức ăn nhất"
+          sub="Chưa biết công thức vào lệnh nào ăn, nên chạy backtest THẬT cho nhiều công thức khác nhau (pullback EMA, RSI bật lại, MACD đảo dấu, breakout, MA cắt, phá bao ATR, tổ hợp confluence...) trên từng khung. TP luôn là T90 causal của đúng khung đó · SL lấy theo swing cấu trúc gần nhất (hợp lý, không nới rộng tuỳ tiện). Top 5 công thức tốt nhất mỗi khung, xếp theo Win% chạm T90 trước, PF sau."
+        >
+          {["h4", "h1"].map((tfKey) =>
+            lab[tfKey] && lab[tfKey].length ? (
+              <div key={tfKey} style={{ marginBottom: 18 }}>
+                <div className="sub" style={{ fontWeight: 700, color: CLR.text, marginBottom: 6 }}>
+                  Khung {tfKey === "h4" ? "4H" : "1H"} — top {lab[tfKey].length} công thức
+                </div>
+                <div style={{ overflowX: "auto" }}>
+                  <table className="tbl">
+                    <thead>
+                      <tr>
+                        <th>#</th>
+                        <th>Công thức</th>
+                        <th>Hướng</th>
+                        <th>Số lệnh</th>
+                        <th>Win% (chạm T90)</th>
+                        <th>Dính SL%</th>
+                        <th>Hết hạn%</th>
+                        <th>R TB/lệnh</th>
+                        <th>PF</th>
+                        <th>Tổng R</th>
+                        <th>MaxDD (R)</th>
+                        <th>Giữ TB (nến)</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {lab[tfKey].map((r, i) => (
+                        <tr key={r.key} className={i === 0 ? "hot" : undefined}>
+                          <td className="num" style={{ color: i === 0 ? CLR.blue : CLR.dim, fontWeight: 800 }}>{i + 1}</td>
+                          <td style={{ fontWeight: 700 }}>{r.label}</td>
+                          <td>
+                            <span style={{ color: r.dirUp ? CLR.bull : CLR.bear, fontWeight: 700 }}>
+                              {r.dirUp ? "Long" : "Short"}
+                            </span>
+                          </td>
+                          <td className="num">{r.m.n}</td>
+                          <td className="num" style={{ color: r.m.win >= 60 ? CLR.bull : r.m.win >= 40 ? CLR.amber : CLR.bear, fontWeight: 700 }}>
+                            {r.m.win}%
+                          </td>
+                          <td className="num" style={{ color: CLR.bear }}>{r.m.slHit}%</td>
+                          <td className="num">{r.m.to}%</td>
+                          <td className="num" style={{ color: r.m.avgR >= 0 ? CLR.bull : CLR.bear }}>{r.m.avgR}R</td>
+                          <td className="num">{r.m.pf === Infinity ? "∞" : r.m.pf}</td>
+                          <td className="num" style={{ color: r.m.totR >= 0 ? CLR.bull : CLR.bear }}>{r.m.totR}R</td>
+                          <td className="num" style={{ color: CLR.amber }}>{r.m.maxDD}R</td>
+                          <td className="num">{r.m.avgHold}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            ) : (
+              <p key={tfKey} className="sub" style={{ color: CLR.dim }}>
+                Khung {tfKey === "h4" ? "4H" : "1H"}: chưa có công thức nào đủ mẫu (≥8 lệnh) để xếp hạng.
+              </p>
+            )
+          )}
+          <p className="sub" style={{ marginTop: 4 }}>
+            Đây là backtest lịch sử, không phải tín hiệu vào lệnh hiện tại — dùng để CHỌN RA công thức đáng thử nghiệm tiếp (kể cả live-forward), không phải để copy máy móc. Số lệnh (n) nhỏ thì đọc thận trọng; ưu tiên công thức vừa Win% cao vừa PF &gt; 1 (nếu PF ≤ 1, dù Win% cao thì trung bình vẫn lỗ do R:R kém).
           </p>
         </Panel>
       )}
@@ -10646,6 +10893,7 @@ export default function App() {
     () => runIndicator90(intradayEntry),
     [intradayEntry]
   );
+  const lab = useMemo(() => runLab(intradayEntry), [intradayEntry]);
 
   const hist = useMemo(() => {
     if (!cfg) return null;
@@ -11144,6 +11392,7 @@ export default function App() {
               step8Model,
               t90Bt,
               indicator90,
+              lab,
               symbol: intradaySymbol,
               opts: intradayOpts,
               setOpts: setIntradayOpts,
