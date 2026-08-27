@@ -2,7 +2,7 @@ name: Fetch screener data (Daily + Weekly OHLC)
 
 on:
   schedule:
-    - cron: "30 22 * * *"
+    - cron: "0 22 * * *"
   workflow_dispatch: {}
 
 permissions:
