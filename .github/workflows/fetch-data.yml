@@ -2,7 +2,10 @@ name: Fetch screener data (Daily + Weekly OHLC)
 
 on:
   schedule:
-    - cron: "40 21 * * *"
+    # 4:10 sáng giờ Việt Nam (UTC+7) = 21:10 UTC ngày hôm trước
+    - cron: "10 21 * * *"
+    # 7:10 sáng giờ Việt Nam (UTC+7) = 00:10 UTC cùng ngày
+    - cron: "10 0 * * *"
   workflow_dispatch: {}
 
 permissions:
